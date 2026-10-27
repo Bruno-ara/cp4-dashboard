@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useState } from 'react'
-import { getCurrentReadings, getSensorHistory } from './api.js'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { API_REFRESH_INTERVAL_MS, getCurrentReadings, getSensorHistory } from './api.js'
 import VineyardMap, { VineyardDetails } from './VineyardMap.jsx'
 
 const metrics = {
@@ -113,6 +113,22 @@ function App() {
   const [historyUpdatedMetric, setHistoryUpdatedMetric] = useState('')
   const [now, setNow] = useState(() => new Date())
   const [selectedVineyard, setSelectedVineyard] = useState(null)
+  const vineyardTriggerRef = useRef(null)
+
+  const openVineyardDetails = useCallback((property, trigger) => {
+    vineyardTriggerRef.current = trigger
+    setSelectedVineyard(property)
+  }, [])
+
+  const closeVineyardDetails = useCallback(() => {
+    setSelectedVineyard(null)
+  }, [])
+
+  useEffect(() => {
+    if (selectedVineyard) return
+    vineyardTriggerRef.current?.focus()
+    vineyardTriggerRef.current = null
+  }, [selectedVineyard])
 
   useEffect(() => {
     let active = true
@@ -124,7 +140,7 @@ function App() {
       inFlight = true
       controller = new AbortController()
       try {
-        const data = await getCurrentReadings(controller.signal)
+        const data = await getCurrentReadings({ signal: controller.signal })
         if (active) {
           setReadings(data)
           setReadingsError('')
@@ -139,7 +155,7 @@ function App() {
     }
 
     loadReadings()
-    const timer = window.setInterval(loadReadings, 30000)
+    const timer = window.setInterval(loadReadings, API_REFRESH_INTERVAL_MS)
     return () => {
       active = false
       window.clearInterval(timer)
@@ -149,13 +165,17 @@ function App() {
 
   useEffect(() => {
     let active = true
-    const controller = new AbortController()
+    let inFlight = false
+    let controller
 
     const loadHistory = async () => {
+      if (inFlight) return
+      inFlight = true
+      controller = new AbortController()
       setHistoryLoading(true)
       setHistoryError('')
       try {
-        const points = await getSensorHistory(metric, 20, controller.signal)
+        const points = await getSensorHistory(metric, 20, { signal: controller.signal })
         if (active) {
           setHistory(points)
           setHistoryAttribute(metric)
@@ -166,14 +186,17 @@ function App() {
       } catch (error) {
         if (active && error.name !== 'AbortError') setHistoryError(error.message)
       } finally {
+        inFlight = false
         if (active) setHistoryLoading(false)
       }
     }
 
     loadHistory()
+    const timer = window.setInterval(loadHistory, API_REFRESH_INTERVAL_MS)
     return () => {
       active = false
-      controller.abort()
+      window.clearInterval(timer)
+      controller?.abort()
     }
   }, [metric, historyRetry])
 
@@ -192,7 +215,7 @@ function App() {
 
   return (
     <div className="app-shell">
-      <aside className="sidebar">
+      <aside className="sidebar" inert={Boolean(selectedVineyard)}>
         <a className="brand" href="#inicio" aria-label="Wineguard — início"><span className="brand-mark"><Icon name="grapes" size={22} /></span><span>wineguard<span className="brand-dot">.</span></span></a>
         <div className="workspace-label">PROPRIEDADE</div>
         <div className="workspace-card"><span className="workspace-avatar"><Icon name="grapes" size={17} /></span><span className="workspace-name">WineSensor002<small>Sensor monitorado</small></span><Icon name="down" size={15} /></div>
@@ -206,12 +229,19 @@ function App() {
         </nav>
         <div className="sidebar-bottom">
           <div className="help-card"><span className="help-icon"><Icon name="grapes" size={18} /></span><strong>Da vinha à adega,<br />cada detalhe importa.</strong><p>Leituras recebidas da API do Wineguard.</p><a href="#historico">Ver histórico <Icon name="arrow" size={14} /></a></div>
-          <div className="profile"><div className="profile-avatar">B</div><div className="profile-info"><strong>Bruno Silva</strong><span>Gestor da vinícola</span></div><Icon name="more" size={18} /></div>
+          <div className="profile"><div className="profile-avatar">D</div><div className="profile-info"><strong>Conta demonstrativa</strong><span>Perfil de exemplo</span></div></div>
         </div>
       </aside>
 
-      <main className="main-content" id="inicio">
-        <header className="topbar"><div className="breadcrumb">Wineguard <Icon name="chevron" size={14} /> <strong>Visão geral</strong></div><div className="top-actions"><span className={`live-status ${readingsError ? 'status-error' : readings ? 'status-connected' : ''}`}><i /> {readingsError ? 'Falha na atualização' : readings ? 'API de leituras' : 'Conectando à API'}</span><div className="top-avatar">B</div></div></header>
+      <main className="main-content" id="inicio" inert={Boolean(selectedVineyard)}>
+        <header className="topbar"><div className="breadcrumb">Wineguard <Icon name="chevron" size={14} /> <strong>Visão geral</strong></div><div className="top-actions"><span className={`live-status ${readingsError ? 'status-error' : readings ? 'status-connected' : ''}`}><i /> {readingsError ? 'Falha na atualização' : readings ? 'API de leituras' : 'Conectando à API'}</span><div className="top-avatar" aria-label="Perfil demonstrativo">D</div></div></header>
+        <nav className="mobile-nav" aria-label="Navegação principal">
+          <a href="#inicio">Visão geral</a>
+          <a href="#mapa-vinicolas">Mapa</a>
+          <a href="#dispositivos">Dispositivo</a>
+          <a href="#historico">Histórico</a>
+          <span aria-disabled="true">Gestão · em breve</span>
+        </nav>
         <div className="page-content">
           <section className="welcome-row"><div><p className="date-label">{new Intl.DateTimeFormat('pt-BR', { weekday: 'long', day: 'numeric', month: 'long' }).format(now)} <span className="welcome-separator">·</span> WINEGUARD</p><h1>Monitoramento da vinícola <span className="wave"><Icon name="grapes" size={21} /></span></h1><p className="page-subtitle">Leituras do sensor WineSensor002. A data e o horário são os recebidos pela API.</p></div><button className="primary-button" disabled title="Aguardando a API de dispositivos"><Icon name="plus" size={18} /> Dispositivos — em breve</button></section>
 
@@ -225,7 +255,7 @@ function App() {
 
           {!readings && <section className="panel readings-state-panel"><RequestMessage loading={readingsLoading} error={readingsError} label="leituras" onRetry={retryReadings} /><p>Sensor consultado: WineSensor002. A conexão depende da configuração do proxy /api.</p></section>}
 
-          <div id="mapa-vinicolas"><VineyardMap onOpenDetails={setSelectedVineyard} /></div>
+          <div id="mapa-vinicolas"><VineyardMap onOpenDetails={openVineyardDetails} /></div>
 
           <section className="content-grid">
             <article className="panel chart-panel" id="historico">
@@ -254,7 +284,7 @@ function App() {
           <footer className="page-footer"><span><i /> Interface Wineguard</span><span>{readings ? `Data da leitura informada pela API: ${formatTimestamp(readings.measuredAt)}` : 'Aguardando dados do backend'} <b>·</b> Sensor: WineSensor002</span></footer>
         </div>
       </main>
-      <VineyardDetails property={selectedVineyard} onClose={() => setSelectedVineyard(null)} />
+      <VineyardDetails property={selectedVineyard} onClose={closeVineyardDetails} />
     </div>
   )
 }

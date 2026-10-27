@@ -17,9 +17,11 @@ Crie `.env.local` na raiz do projeto usando `.env.example` como modelo e informe
 
 ```env
 VITE_API_TARGET=http://<IP_DO_BACKEND>
+VITE_API_TIMEOUT_MS=10000
+VITE_API_REFRESH_INTERVAL_MS=30000
 ```
 
-O Vite encaminha `/api` para o endereço configurado em `VITE_API_TARGET`. O proxy fica desativado quando essa variável não está definida. `.env.local` é ignorado pelo Git; não publique nele o endereço da infraestrutura. Reinicie o servidor do Vite após alterar essa configuração:
+O Vite encaminha `/api` para o endereço configurado em `VITE_API_TARGET`. O proxy fica desativado quando essa variável não está definida. `VITE_API_TIMEOUT_MS` configura o prazo por consulta e `VITE_API_REFRESH_INTERVAL_MS` configura a atualização das leituras e do histórico; ambos são milissegundos e usam os valores acima como padrão. `.env.local` é ignorado pelo Git; não publique nele o endereço da infraestrutura. Reinicie o servidor do Vite após alterar essa configuração:
 
 ```bash
 npm run dev
@@ -34,7 +36,7 @@ O React deve continuar usando rotas relativas, como `/api/sensors/WineSensor002/
 
 Os atributos históricos aceitos são `temperature`, `humidity` e `luminosity`; `limit` aceita valores de 1 a 100. A luminosidade é mostrada sem unidade física, pois a escala do LDR ainda não foi calibrada. Horários são exibidos no fuso local do navegador, com o identificador de fuso retornado por `Intl`.
 
-As leituras atuais são atualizadas a cada 30 segundos sem sobreposição de requisições. Leituras e histórico têm estados independentes de carregamento, falha e ausência de dados; uma falha de atualização mantém visível a última resposta bem-sucedida.
+As leituras atuais e o histórico são atualizados a cada 30 segundos sem sobreposição de requisições. Leituras e histórico têm estados independentes de carregamento, falha, timeout e ausência de dados; uma falha de atualização mantém visível a última resposta bem-sucedida. A navegação mobile oferece links diretos para as seções disponíveis. O perfil é identificado apenas como demonstrativo até haver autenticação integrada.
 
 ## Mapa global
 

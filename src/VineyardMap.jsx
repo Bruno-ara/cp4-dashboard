@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { MapContainer, Marker, TileLayer, useMap } from 'react-leaflet'
 import L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
@@ -81,7 +81,7 @@ export default function VineyardMap({ onOpenDetails }) {
               <h3>{visibleProperty.name}</h3>
               <p>{visibleProperty.region} · {visibleProperty.country}</p>
               <span className="map-preview-pending">Aguardando integração com o backend</span>
-              <button className="map-details-button" onClick={() => onOpenDetails(visibleProperty)}>Ver detalhes da vinícola <span aria-hidden="true">→</span></button>
+              <button className="map-details-button" onClick={(event) => onOpenDetails(visibleProperty, event.currentTarget)}>Ver detalhes da vinícola <span aria-hidden="true">→</span></button>
             </article>
           )}
         </div>
@@ -109,19 +109,47 @@ export default function VineyardMap({ onOpenDetails }) {
 }
 
 export function VineyardDetails({ property, onClose }) {
+  const dialogRef = useRef(null)
+  const closeButtonRef = useRef(null)
+
   useEffect(() => {
     if (!property) return undefined
-    const closeOnEscape = (event) => { if (event.key === 'Escape') onClose() }
-    window.addEventListener('keydown', closeOnEscape)
-    return () => window.removeEventListener('keydown', closeOnEscape)
-  }, [property, onClose])
+    closeButtonRef.current?.focus()
+    return undefined
+  }, [property])
 
   if (!property) return null
 
+  const trapDialogFocus = (event) => {
+    if (event.key === 'Escape') {
+      event.preventDefault()
+      onClose()
+      return
+    }
+    if (event.key !== 'Tab') return
+
+    const focusableElements = dialogRef.current?.querySelectorAll('button:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])')
+    if (!focusableElements?.length) {
+      event.preventDefault()
+      dialogRef.current?.focus()
+      return
+    }
+
+    const first = focusableElements[0]
+    const last = focusableElements[focusableElements.length - 1]
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault()
+      last.focus()
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault()
+      first.focus()
+    }
+  }
+
   return (
     <div className="vineyard-modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}>
-      <section className="vineyard-modal" role="dialog" aria-modal="true" aria-labelledby="vineyard-modal-title">
-        <button className="vineyard-modal-close" onClick={onClose} aria-label="Fechar detalhes">×</button>
+      <section className="vineyard-modal" ref={dialogRef} onKeyDown={trapDialogFocus} role="dialog" aria-modal="true" aria-labelledby="vineyard-modal-title" tabIndex="-1">
+        <button className="vineyard-modal-close" ref={closeButtonRef} onClick={onClose} aria-label="Fechar detalhes">×</button>
         <span className="map-preview-eyebrow">DETALHES · LOCALIZAÇÃO ILUSTRATIVA</span>
         <h2 id="vineyard-modal-title">{property.name}</h2>
         <p className="vineyard-modal-region">{property.region} · {property.country}</p>

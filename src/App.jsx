@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { API_REFRESH_INTERVAL_MS, getCurrentReadings, getSensorHistory } from './api.js'
+import { API_REFRESH_INTERVAL_MS, ApiError, getCsrfToken, getCurrentReadings, getSensorHistory, getSession, login, logout as endSession } from './api.js'
 import VineyardMap, { VineyardDetails } from './VineyardMap.jsx'
 
 const metrics = {
@@ -98,7 +98,45 @@ function RequestMessage({ loading, error, empty, onRetry, label }) {
   return null
 }
 
+function LoginScreen({ onLogin, error, busy }) {
+  const [username, setUsername] = useState('')
+  const [password, setPassword] = useState('')
+
+  const submit = async (event) => {
+    event.preventDefault()
+    if (await onLogin(username, password)) setPassword('')
+  }
+
+  return (
+    <main className="auth-page">
+      <section className="auth-card" aria-labelledby="login-title">
+        <div className="auth-brand"><span className="brand-mark"><Icon name="grapes" size={22} /></span><span>wineguard<span className="brand-dot">.</span></span></div>
+        <p className="auth-eyebrow">PAINEL DE MONITORAMENTO</p>
+        <h1 id="login-title">Acesse sua conta</h1>
+        <p className="auth-description">Entre com as credenciais fornecidas pelo responsável pelo backend.</p>
+        <form className="login-form" onSubmit={submit}>
+          <label htmlFor="login-username">Usuário</label>
+          <input id="login-username" name="username" type="text" autoComplete="username" value={username} onChange={(event) => setUsername(event.target.value)} required disabled={busy} />
+          <label htmlFor="login-password">Senha</label>
+          <input id="login-password" name="password" type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} required disabled={busy} />
+          {error && <p className="auth-error" role="alert">{error}</p>}
+          <button className="auth-submit" type="submit" disabled={busy}>{busy ? 'Entrando…' : 'Entrar'}</button>
+        </form>
+        <p className="auth-footnote">Não há cadastro público nem recuperação de senha. Solicite acesso à equipe responsável.</p>
+      </section>
+    </main>
+  )
+}
+
 function App() {
+  const [authStatus, setAuthStatus] = useState('checking')
+  const [user, setUser] = useState(null)
+  const [csrf, setCsrf] = useState(null)
+  const [authError, setAuthError] = useState('')
+  const [authBusy, setAuthBusy] = useState(false)
+  const [logoutBusy, setLogoutBusy] = useState(false)
+  const [logoutError, setLogoutError] = useState('')
+  const [logoutRetryAllowed, setLogoutRetryAllowed] = useState(true)
   const [readings, setReadings] = useState(null)
   const [readingsError, setReadingsError] = useState('')
   const [readingsLoading, setReadingsLoading] = useState(true)
@@ -114,6 +152,99 @@ function App() {
   const [now, setNow] = useState(() => new Date())
   const [selectedVineyard, setSelectedVineyard] = useState(null)
   const vineyardTriggerRef = useRef(null)
+
+  const checkSession = useCallback(async (options = {}) => {
+    try {
+      const session = await getSession(options)
+      const token = await getCsrfToken(options)
+      setUser(session)
+      setCsrf(token)
+      setAuthStatus('authenticated')
+    } catch (error) {
+      if (options.signal?.aborted || error.name === 'AbortError') return
+      setUser(null)
+      setCsrf(null)
+      if (error instanceof ApiError && error.status === 401) {
+        setAuthStatus('anonymous')
+        setAuthError('')
+      } else if (error instanceof ApiError && error.status === 403) {
+        setAuthStatus('error')
+        setAuthError('Acesso negado pelo backend ao verificar a sessão (HTTP 403).')
+      } else {
+        setAuthStatus('error')
+        setAuthError(error.message)
+      }
+    }
+  }, [])
+
+  useEffect(() => {
+    const controller = new AbortController()
+    const timer = window.setTimeout(() => checkSession({ signal: controller.signal }), 0)
+    return () => {
+      window.clearTimeout(timer)
+      controller.abort()
+    }
+  }, [checkSession])
+
+  const retrySessionCheck = () => {
+    setAuthStatus('checking')
+    setAuthError('')
+    checkSession()
+  }
+
+  const handleLogin = async (username, password) => {
+    setAuthBusy(true)
+    setAuthError('')
+    let loginSucceeded = false
+    try {
+      const initialToken = await getCsrfToken()
+      await login(username, password, initialToken)
+      loginSucceeded = true
+      const refreshedToken = await getCsrfToken()
+      const session = await getSession()
+      setUser(session)
+      setCsrf(refreshedToken)
+      setAuthStatus('authenticated')
+      return true
+    } catch (error) {
+      setAuthStatus(loginSucceeded ? 'error' : 'anonymous')
+      if (error instanceof ApiError && error.status === 401) {
+        setAuthError('Usuário ou senha inválidos.')
+      } else if (error instanceof ApiError && error.status === 403) {
+        setAuthError('Acesso negado: o token CSRF foi recusado. Tente novamente.')
+      } else {
+        setAuthError(error.message)
+      }
+      return false
+    } finally {
+      setAuthBusy(false)
+    }
+  }
+
+  const handleLogout = async () => {
+    setLogoutBusy(true)
+    setLogoutError('')
+    setLogoutRetryAllowed(true)
+    try {
+      await endSession(csrf)
+      setUser(null)
+      setCsrf(null)
+      setAuthStatus('anonymous')
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 401) {
+        setUser(null)
+        setCsrf(null)
+        setAuthStatus('anonymous')
+      } else if (error instanceof ApiError && error.status === 403) {
+        setLogoutError('Acesso negado: o token CSRF foi recusado. A sessão foi mantida.')
+        setLogoutRetryAllowed(false)
+      } else {
+        setLogoutError(error.message)
+      }
+    } finally {
+      setLogoutBusy(false)
+    }
+  }
 
   const openVineyardDetails = useCallback((property, trigger) => {
     vineyardTriggerRef.current = trigger
@@ -131,6 +262,7 @@ function App() {
   }, [selectedVineyard])
 
   useEffect(() => {
+    if (authStatus !== 'authenticated') return undefined
     let active = true
     let inFlight = false
     let controller
@@ -161,9 +293,10 @@ function App() {
       window.clearInterval(timer)
       controller?.abort()
     }
-  }, [readingsRetry])
+  }, [authStatus, readingsRetry])
 
   useEffect(() => {
+    if (authStatus !== 'authenticated') return undefined
     let active = true
     let inFlight = false
     let controller
@@ -198,7 +331,7 @@ function App() {
       window.clearInterval(timer)
       controller?.abort()
     }
-  }, [metric, historyRetry])
+  }, [authStatus, metric, historyRetry])
 
   const currentValues = useMemo(() => ({
     temperature: readings?.temperature,
@@ -212,6 +345,16 @@ function App() {
   }
   const retryHistory = () => setHistoryRetry((current) => current + 1)
   const hasCurrentHistory = historyAttribute === metric
+
+  if (authStatus === 'checking') {
+    return <main className="auth-page"><p className="auth-status" role="status">Verificando sessão…</p></main>
+  }
+  if (authStatus === 'error') {
+    return <main className="auth-page"><section className="auth-card" aria-labelledby="session-error-title"><div className="auth-brand"><span className="brand-mark"><Icon name="grapes" size={22} /></span><span>wineguard<span className="brand-dot">.</span></span></div><h1 id="session-error-title">Não foi possível verificar a sessão</h1><p className="auth-error" role="alert">{authError}</p><button className="auth-submit" onClick={retrySessionCheck}>Tentar novamente</button></section></main>
+  }
+  if (authStatus !== 'authenticated') {
+    return <LoginScreen onLogin={handleLogin} error={authError} busy={authBusy} />
+  }
 
   return (
     <div className="app-shell">
@@ -229,12 +372,12 @@ function App() {
         </nav>
         <div className="sidebar-bottom">
           <div className="help-card"><span className="help-icon"><Icon name="grapes" size={18} /></span><strong>Da vinha à adega,<br />cada detalhe importa.</strong><p>Leituras recebidas da API do Wineguard.</p><a href="#historico">Ver histórico <Icon name="arrow" size={14} /></a></div>
-          <div className="profile"><div className="profile-avatar">D</div><div className="profile-info"><strong>Conta demonstrativa</strong><span>Perfil de exemplo</span></div></div>
+          <div className="profile"><div className="profile-avatar">{user.username.slice(0, 1).toUpperCase()}</div><div className="profile-info"><strong>{user.username}</strong><span>Usuário autenticado</span></div></div>
         </div>
       </aside>
 
       <main className="main-content" id="inicio" inert={Boolean(selectedVineyard)}>
-        <header className="topbar"><div className="breadcrumb">Wineguard <Icon name="chevron" size={14} /> <strong>Visão geral</strong></div><div className="top-actions"><span className={`live-status ${readingsError ? 'status-error' : readings ? 'status-connected' : ''}`}><i /> {readingsError ? 'Falha na atualização' : readings ? 'API de leituras' : 'Conectando à API'}</span><div className="top-avatar" aria-label="Perfil demonstrativo">D</div></div></header>
+        <header className="topbar"><div className="breadcrumb">Wineguard <Icon name="chevron" size={14} /> <strong>Visão geral</strong></div><div className="top-actions"><span className={`live-status ${readingsError ? 'status-error' : readings ? 'status-connected' : ''}`}><i /> {readingsError ? 'Falha na atualização' : readings ? 'API de leituras' : 'Conectando à API'}</span><span className="authenticated-user">{user.username}</span><button className="logout-button" onClick={handleLogout} disabled={logoutBusy}>{logoutBusy ? 'Saindo…' : 'Sair'}</button></div></header>
         <nav className="mobile-nav" aria-label="Navegação principal">
           <a href="#inicio">Visão geral</a>
           <a href="#mapa-vinicolas">Mapa</a>
@@ -243,6 +386,7 @@ function App() {
           <span aria-disabled="true">Gestão · em breve</span>
         </nav>
         <div className="page-content">
+          {logoutError && <div className="inline-warning" role="alert"><span>{logoutError}</span>{logoutRetryAllowed && <button className="retry-button" onClick={handleLogout} disabled={logoutBusy}>Tentar novamente</button>}</div>}
           <section className="welcome-row"><div><p className="date-label">{new Intl.DateTimeFormat('pt-BR', { weekday: 'long', day: 'numeric', month: 'long' }).format(now)} <span className="welcome-separator">·</span> WINEGUARD</p><h1>Monitoramento da vinícola <span className="wave"><Icon name="grapes" size={21} /></span></h1><p className="page-subtitle">Leituras do sensor WineSensor002. A data e o horário são os recebidos pela API.</p></div><button className="primary-button" disabled title="Aguardando a API de dispositivos"><Icon name="plus" size={18} /> Dispositivos — em breve</button></section>
 
           {readingsError && readings && <div className="inline-warning" role="alert"><span>Falha ao atualizar as leituras. Exibindo a última resposta recebida.</span><button className="retry-button" onClick={retryReadings}>Tentar novamente</button></div>}

@@ -10,6 +10,14 @@ function readPositiveSetting(value, fallback) {
 export const API_TIMEOUT_MS = readPositiveSetting(import.meta.env?.VITE_API_TIMEOUT_MS, DEFAULT_TIMEOUT_MS)
 export const API_REFRESH_INTERVAL_MS = readPositiveSetting(import.meta.env?.VITE_API_REFRESH_INTERVAL_MS, DEFAULT_REFRESH_INTERVAL_MS)
 
+export class ApiError extends Error {
+  constructor(message, status) {
+    super(message)
+    this.name = 'ApiError'
+    this.status = status
+  }
+}
+
 function isValidTimestamp(value) {
   return typeof value === 'string' && value.trim() !== '' && Number.isFinite(Date.parse(value))
 }
@@ -18,7 +26,7 @@ function isNumberOrNull(value) {
   return value === null || (typeof value === 'number' && Number.isFinite(value))
 }
 
-async function getJson(path, { signal, timeoutMs = API_TIMEOUT_MS } = {}) {
+async function getJson(path, { signal, timeoutMs = API_TIMEOUT_MS, ...requestOptions } = {}) {
   const controller = new AbortController()
   let timedOut = false
   const abortFromCaller = () => controller.abort(signal.reason)
@@ -30,10 +38,15 @@ async function getJson(path, { signal, timeoutMs = API_TIMEOUT_MS } = {}) {
   }, timeoutMs)
 
   try {
-    const response = await fetch(path, { headers: { Accept: 'application/json' }, signal: controller.signal })
+    const response = await fetch(path, {
+      ...requestOptions,
+      credentials: 'same-origin',
+      headers: { Accept: 'application/json', ...requestOptions.headers },
+      signal: controller.signal,
+    })
 
     if (!response.ok) {
-      throw new Error(`O backend respondeu com erro HTTP ${response.status}. Tente novamente.`)
+      throw new ApiError(`O backend respondeu com erro HTTP ${response.status}. Tente novamente.`, response.status)
     }
 
     if (!response.headers.get('content-type')?.includes('application/json')) {
@@ -54,11 +67,68 @@ async function getJson(path, { signal, timeoutMs = API_TIMEOUT_MS } = {}) {
       throw timeoutError
     }
     if (signal?.aborted || error.name === 'AbortError') throw error
-    if (error.message.startsWith('O backend respondeu com erro HTTP') || error.message.startsWith('A resposta não está em JSON') || error.message.startsWith('O backend retornou uma resposta JSON inválida')) throw error
+    if (error instanceof ApiError || error.message.startsWith('A resposta não está em JSON') || error.message.startsWith('O backend retornou uma resposta JSON inválida')) throw error
     throw new Error('Não foi possível conectar ao backend. Verifique a configuração do proxy e tente novamente.', { cause: error })
   } finally {
     clearTimeout(timeout)
     signal?.removeEventListener('abort', abortFromCaller)
+  }
+}
+
+function validateCsrfToken(data) {
+  if (!data || typeof data !== 'object' || Array.isArray(data) ||
+      typeof data.headerName !== 'string' || !/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(data.headerName) ||
+      typeof data.token !== 'string' || data.token.trim() === '') {
+    throw new Error('A resposta do token CSRF não corresponde ao formato esperado.')
+  }
+  return { headerName: data.headerName, token: data.token }
+}
+
+export async function getCsrfToken(options) {
+  return validateCsrfToken(await getJson('/api/auth/csrf', options))
+}
+
+export async function login(username, password, csrf, options = {}) {
+  if (typeof username !== 'string' || username.trim() === '' || typeof password !== 'string' || password === '') {
+    throw new Error('Informe usuário e senha.')
+  }
+  if (!csrf?.headerName || !csrf?.token) {
+    throw new Error('Não foi possível validar a solicitação de login. Tente novamente.')
+  }
+
+  const data = await getJson('/api/auth/login', {
+    ...options,
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      [csrf.headerName]: csrf.token,
+    },
+    body: new URLSearchParams({ username: username.trim(), password }),
+  })
+  if (data?.status !== 'authenticated') {
+    throw new Error('A resposta de login não corresponde ao formato esperado.')
+  }
+}
+
+export async function getSession(options) {
+  const data = await getJson('/api/auth/me', options)
+  if (!data || typeof data !== 'object' || Array.isArray(data) || typeof data.username !== 'string' || data.username.trim() === '') {
+    throw new Error('A resposta da sessão não corresponde ao formato esperado.')
+  }
+  return { username: data.username }
+}
+
+export async function logout(csrf, options = {}) {
+  if (!csrf?.headerName || !csrf?.token) {
+    throw new Error('Não foi possível validar a solicitação de encerramento da sessão.')
+  }
+  const data = await getJson('/api/auth/logout', {
+    ...options,
+    method: 'POST',
+    headers: { [csrf.headerName]: csrf.token },
+  })
+  if (data?.status !== 'logged_out') {
+    throw new Error('A resposta de encerramento da sessão não corresponde ao formato esperado.')
   }
 }
 

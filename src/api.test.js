@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { getCurrentReadings, getSensorHistory } from './api.js'
+import { ApiError, getCsrfToken, getCurrentReadings, getSensorHistory, getSession, login, logout } from './api.js'
 
 const currentFixture = {
   id: 'WineSensor002',
@@ -99,5 +99,72 @@ test('preserves intentional caller cancellation as AbortError', async () => {
     const request = getSensorHistory('humidity', 20, { signal: controller.signal, timeoutMs: 1000 })
     controller.abort()
     await assert.rejects(request, (error) => error.name === 'AbortError')
+  })
+})
+
+test('loads and validates the CSRF token and authenticated session', async () => {
+  await withFetch(async (url, options) => {
+    assert.equal(options.credentials, 'same-origin')
+    if (url === '/api/auth/csrf') {
+      return new Response(JSON.stringify({ headerName: 'X-CSRF-TOKEN', token: 'csrf-in-memory' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })
+    }
+    assert.equal(url, '/api/auth/me')
+    return new Response(JSON.stringify({ username: 'wine-manager' }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    })
+  }, async () => {
+    assert.deepEqual(await getCsrfToken(), { headerName: 'X-CSRF-TOKEN', token: 'csrf-in-memory' })
+    assert.deepEqual(await getSession(), { username: 'wine-manager' })
+  })
+
+  await withFetch(respond({ headerName: 'X-CSRF-TOKEN\r\nInjected', token: 'csrf' }), async () => {
+    await assert.rejects(getCsrfToken(), /token CSRF não corresponde/)
+  })
+})
+
+test('sends login and logout with form encoding, same-origin cookies, and CSRF header', async () => {
+  const csrf = { headerName: 'X-CSRF-TOKEN', token: 'csrf-in-memory' }
+  const calls = []
+  await withFetch(async (url, options) => {
+    calls.push({ url, options })
+    const body = url.endsWith('/login') ? { status: 'authenticated' } : { status: 'logged_out' }
+    return new Response(JSON.stringify(body), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    })
+  }, async () => {
+    await login('wine-manager', 'secret password', csrf)
+    await logout(csrf)
+  })
+
+  assert.equal(calls[0].url, '/api/auth/login')
+  assert.equal(calls[0].options.method, 'POST')
+  assert.equal(calls[0].options.credentials, 'same-origin')
+  assert.equal(calls[0].options.headers['Content-Type'], 'application/x-www-form-urlencoded')
+  assert.equal(calls[0].options.headers['X-CSRF-TOKEN'], csrf.token)
+  assert.equal(calls[0].options.body.toString(), 'username=wine-manager&password=secret+password')
+  assert.equal(calls[1].url, '/api/auth/logout')
+  assert.equal(calls[1].options.method, 'POST')
+  assert.equal(calls[1].options.headers['X-CSRF-TOKEN'], csrf.token)
+  assert.equal(calls[1].options.body, undefined)
+})
+
+test('preserves HTTP status for authentication and access-denied handling', async () => {
+  await withFetch(async () => new Response(JSON.stringify({ error: 'unauthorized' }), {
+    status: 401,
+    headers: { 'content-type': 'application/json' },
+  }), async () => {
+    await assert.rejects(getSession(), (error) => error instanceof ApiError && error.status === 401)
+  })
+
+  await withFetch(async () => new Response(JSON.stringify({ error: 'forbidden' }), {
+    status: 403,
+    headers: { 'content-type': 'application/json' },
+  }), async () => {
+    await assert.rejects(login('wine-manager', 'incorrect', { headerName: 'X-CSRF-TOKEN', token: 'token' }), (error) => error instanceof ApiError && error.status === 403)
   })
 })

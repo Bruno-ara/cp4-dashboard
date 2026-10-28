@@ -1,6 +1,21 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { ApiError, getCsrfToken, getCurrentReadings, getSensorHistory, getSession, login, logout } from './api.js'
+import {
+  ApiError,
+  createDevice,
+  createEnvironment,
+  getCsrfToken,
+  getCurrentReadings,
+  getDeviceLimits,
+  getDevices,
+  getEnvironments,
+  getSensorHistory,
+  getSession,
+  login,
+  logout,
+  saveDeviceLimit,
+  subscribeToSessionExpiration,
+} from './api.js'
 
 const currentFixture = {
   id: 'WineSensor002',
@@ -167,4 +182,116 @@ test('preserves HTTP status for authentication and access-denied handling', asyn
   }), async () => {
     await assert.rejects(login('wine-manager', 'incorrect', { headerName: 'X-CSRF-TOKEN', token: 'token' }), (error) => error instanceof ApiError && error.status === 403)
   })
+})
+
+test('expires the open dashboard on protected 401 without treating session checks as protected data calls', async () => {
+  let expirationCount = 0
+  const unsubscribe = subscribeToSessionExpiration(() => {
+    expirationCount += 1
+  })
+
+  try {
+    await withFetch(async () => new Response(JSON.stringify({ error: 'unauthorized' }), {
+      status: 401,
+      headers: { 'content-type': 'application/json' },
+    }), async () => {
+      await assert.rejects(getSession(), (error) => error instanceof ApiError && error.status === 401)
+      assert.equal(expirationCount, 0)
+      await assert.rejects(getCurrentReadings(), (error) => error instanceof ApiError && error.status === 401)
+    })
+    assert.equal(expirationCount, 1)
+  } finally {
+    unsubscribe()
+  }
+})
+
+test('uses the Java environment, device, and limit contracts', async () => {
+  const environment = { id: 2, name: 'Adega principal', description: 'Setor norte' }
+  const device = {
+    id: 9,
+    name: 'WineGuard 002',
+    fiwareId: 'wine002',
+    fiwareType: 'WineSensor002',
+    fiwareService: 'vinheria',
+    fiwareServicePath: '/',
+    environmentId: environment.id,
+    environmentName: environment.name,
+    active: true,
+  }
+  const limit = { id: 12, deviceId: device.id, metric: 'TEMPERATURE', minimumValue: 10, maximumValue: 18, unit: '°C' }
+  const calls = []
+
+  await withFetch(async (url, options) => {
+    calls.push({ url, options })
+    const data = url === '/api/environments'
+      ? options.method === 'POST' ? environment : [environment]
+      : url === '/api/devices'
+        ? options.method === 'POST' ? device : [device]
+        : url.endsWith('/limits') && options.method === 'PUT' ? limit : [limit]
+    return new Response(JSON.stringify(data), {
+      status: options.method === 'POST' ? 201 : 200,
+      headers: { 'content-type': 'application/json' },
+    })
+  }, async () => {
+    assert.deepEqual(await getEnvironments(), [environment])
+    assert.deepEqual(await createEnvironment({ name: 'Adega principal', description: 'Setor norte' }), environment)
+    assert.deepEqual(await createEnvironment({ name: 'Adega sem descrição' }), environment)
+    assert.deepEqual(await getDevices(), [device])
+    assert.deepEqual(await createDevice({
+      name: device.name,
+      fiwareId: device.fiwareId,
+      fiwareType: device.fiwareType,
+      fiwareService: device.fiwareService,
+      fiwareServicePath: device.fiwareServicePath,
+      environmentId: device.environmentId,
+    }), device)
+    assert.deepEqual(await getDeviceLimits(device.id), [limit])
+    assert.deepEqual(await saveDeviceLimit(device.id, {
+      metric: limit.metric,
+      minimumValue: limit.minimumValue,
+      maximumValue: limit.maximumValue,
+      unit: limit.unit,
+    }), limit)
+  })
+
+  assert.deepEqual(calls.map(({ url, options }) => [url, options.method || 'GET']), [
+    ['/api/environments', 'GET'],
+    ['/api/environments', 'POST'],
+    ['/api/environments', 'POST'],
+    ['/api/devices', 'GET'],
+    ['/api/devices', 'POST'],
+    ['/api/devices/9/limits', 'GET'],
+    ['/api/devices/9/limits', 'PUT'],
+  ])
+  assert.equal(calls[1].options.headers['Content-Type'], 'application/json')
+  assert.deepEqual(JSON.parse(calls[1].options.body), { name: environment.name, description: environment.description })
+  assert.deepEqual(JSON.parse(calls[2].options.body), { name: 'Adega sem descrição', description: null })
+  assert.deepEqual(JSON.parse(calls[4].options.body), {
+    name: device.name,
+    fiwareId: device.fiwareId,
+    fiwareType: device.fiwareType,
+    fiwareService: device.fiwareService,
+    fiwareServicePath: device.fiwareServicePath,
+    environmentId: device.environmentId,
+  })
+  assert.equal(calls.every(({ options }) => options.credentials === 'same-origin'), true)
+})
+
+test('rejects invalid environment, device, and limit inputs before sending requests', async () => {
+  await assert.rejects(createEnvironment({ name: ' ', description: null }), /nome válido/)
+  await assert.rejects(createDevice({
+    name: 'Sensor',
+    fiwareId: 'wine002',
+    fiwareType: 'WineSensor002',
+    fiwareService: 'vinheria',
+    fiwareServicePath: '/',
+    environmentId: 0,
+  }), /ambiente válido/)
+  await assert.rejects(getDeviceLimits(0), /inteiro positivo/)
+  await assert.rejects(saveDeviceLimit(1, {
+    metric: 'TEMPERATURE',
+    minimumValue: null,
+    maximumValue: null,
+    unit: '°C',
+  }), /ao menos um limite válido/)
 })

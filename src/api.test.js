@@ -17,6 +17,8 @@ import {
   login,
   logout,
   provisionDevice,
+  retryAndWatchDeviceConfiguration,
+  retryDeviceConfiguration,
   saveDeviceLimit,
   sendDeviceAlert,
   subscribeToSessionExpiration,
@@ -120,6 +122,41 @@ test('preserves intentional caller cancellation as AbortError', async () => {
     signal.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true })
   }), async () => {
     const request = getSensorHistory('humidity', 20, { signal: controller.signal, timeoutMs: 1000 })
+    controller.abort()
+    await assert.rejects(request, (error) => error.name === 'AbortError')
+  })
+})
+
+test('keeps the timeout active after immediate headers until the JSON body is read', async () => {
+  await withFetch(async (_url, { signal }) => {
+    const response = new Response(null, { headers: { 'content-type': 'application/json' } })
+    response.json = () => new Promise((resolve, reject) => {
+      const bodyTimer = setTimeout(() => resolve(currentFixture), 300)
+      signal.addEventListener('abort', () => {
+        clearTimeout(bodyTimer)
+        reject(new DOMException('Aborted', 'AbortError'))
+      }, { once: true })
+    })
+    return response
+  }, async () => {
+    await assert.rejects(getCurrentReadings({ timeoutMs: 100 }), (error) => error.name === 'TimeoutError')
+  })
+})
+
+test('preserves caller cancellation while reading a JSON body', async () => {
+  const controller = new AbortController()
+  let bodyReadStarted
+  const started = new Promise((resolve) => { bodyReadStarted = resolve })
+  await withFetch(async (_url, { signal }) => {
+    const response = new Response(null, { headers: { 'content-type': 'application/json' } })
+    response.json = () => new Promise((_resolve, reject) => {
+      bodyReadStarted()
+      signal.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true })
+    })
+    return response
+  }, async () => {
+    const request = getCurrentReadings({ signal: controller.signal, timeoutMs: 1000 })
+    await started
     controller.abort()
     await assert.rejects(request, (error) => error.name === 'AbortError')
   })
@@ -417,6 +454,22 @@ test('validates complete ESP configuration bounds and decimal precision without 
   ]) {
     assert.throws(() => validateDeviceConfigurationValues(invalid), /Revise os limites/)
   }
+
+  for (const [minimum, maximum] of [[15.1, 17.1], [15.1, 17], [40.1, 46.1], [40.1, 46]]) {
+    assert.throws(() => validateDeviceConfigurationValues({
+      ...validConfigurationValues,
+      ...(minimum < 20
+        ? { temperatureMin: minimum, temperatureMax: maximum }
+        : { humidityMin: minimum, humidityMax: maximum }),
+    }), /Revise os limites/)
+  }
+  assert.doesNotThrow(() => validateDeviceConfigurationValues({
+    ...validConfigurationValues,
+    temperatureMin: 15.1,
+    temperatureMax: 17.2,
+    humidityMin: 40.1,
+    humidityMax: 46.2,
+  }))
 })
 
 test('validates configuration states and returns confirmation metadata', async () => {
@@ -550,14 +603,14 @@ test('does not treat an older applied revision as confirmation after a failed PO
     await assert.rejects(
       submitAndWatchDeviceConfiguration(9, validConfigurationValues, csrfFixture, {
         previousRevision: 7,
-        intervalMs: 1,
-        timeoutMs: 6,
+        intervalMs: 5000,
+        timeoutMs: 250,
       }),
       (error) => error.name === 'ConfigurationOutcomeUnknownError',
     )
   })
   assert.equal(postCount, 1)
-  assert.ok(getCount > 1)
+  assert.equal(getCount, 1)
 })
 
 test('cancels configuration polling without issuing another GET', async () => {
@@ -630,4 +683,294 @@ test('includes backend field validation details in API errors', async () => {
       error.status === 400 &&
       /temperatureMin: deve ser maior ou igual a -20/.test(error.message))
   })
+
+  await withFetch(async () => new Response(JSON.stringify({
+    detail: 'Revise os campos enviados.',
+    status: 400,
+    fields: { temperatureMin: 'mensagem de validação' },
+  }), {
+    status: 400,
+    headers: { 'content-type': 'application/json' },
+  }), async () => {
+    await assert.rejects(createDeviceConfiguration(9, validConfigurationValues, csrfFixture), (error) =>
+      error instanceof ApiError &&
+      error.status === 400 &&
+      /Revise os campos enviados/.test(error.message) &&
+      /temperatureMin: mensagem de validação/.test(error.message))
+  })
+})
+
+test('posts same-revision recovery with CSRF and no body', async () => {
+  let call
+  const applied = configurationFixture({ revision: 12, state: 'APPLIED' })
+  await withFetch(async (url, options) => {
+    call = { url, options }
+    return new Response(JSON.stringify(applied), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    })
+  }, async () => {
+    assert.deepEqual(await retryDeviceConfiguration(9, 12, csrfFixture), applied)
+  })
+  assert.equal(call.url, '/api/devices/9/configuration/12/retry')
+  assert.equal(call.options.method, 'POST')
+  assert.equal(call.options.headers['X-CSRF-TOKEN'], csrfFixture.token)
+  assert.equal(call.options.body, undefined)
+})
+
+test('returns a 200 retry confirmation without starting another GET watch', async () => {
+  const calls = []
+  await withFetch(async (url, options) => {
+    calls.push({ url, options })
+    const configuration = options.method === 'POST'
+      ? configurationFixture({ revision: 12, state: 'APPLIED' })
+      : configurationFixture({ revision: 12, state: 'UNCONFIRMED' })
+    return new Response(JSON.stringify(configuration), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    })
+  }, async () => {
+    const result = await retryAndWatchDeviceConfiguration(9, 12, csrfFixture, {
+      confirmRetry: () => true,
+    })
+    assert.equal(result.state, 'APPLIED')
+  })
+  assert.deepEqual(calls.map(({ url, options }) => [url, options.method || 'GET']), [
+    ['/api/devices/9/configuration', 'GET'],
+    ['/api/devices/9/configuration/12/retry', 'POST'],
+  ])
+})
+
+test('blocks a duplicate same-device retry before a second POST', async () => {
+  let postCount = 0
+  let confirmations = 0
+  let releaseConfirmations
+  const confirmationGate = new Promise((resolve) => { releaseConfirmations = resolve })
+  await withFetch(async (_url, options) => {
+    if (options.method === 'POST') postCount += 1
+    const configuration = options.method === 'POST'
+      ? configurationFixture({ revision: 12, state: 'APPLIED' })
+      : configurationFixture({ revision: 12, state: 'UNCONFIRMED' })
+    return new Response(JSON.stringify(configuration), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    })
+  }, async () => {
+    const confirmRetry = async () => {
+      confirmations += 1
+      if (confirmations === 2) releaseConfirmations()
+      await confirmationGate
+      return true
+    }
+    const results = await Promise.allSettled([
+      retryAndWatchDeviceConfiguration(9, 12, csrfFixture, { confirmRetry }),
+      retryAndWatchDeviceConfiguration(9, 12, csrfFixture, { confirmRetry }),
+    ])
+    assert.equal(results.filter((result) => result.status === 'fulfilled').length, 1)
+    assert.equal(results.filter((result) => result.status === 'rejected').length, 1)
+  })
+  assert.equal(postCount, 1)
+})
+
+test('follows a 202 same-revision retry with sequential GET polling', async () => {
+  const calls = []
+  let postCount = 0
+  await withFetch(async (url, options) => {
+    calls.push({ url, options })
+    if (options.method === 'POST') {
+      postCount += 1
+      return new Response(JSON.stringify(configurationFixture({ revision: 12, state: 'PENDING' })), {
+        status: 202,
+        headers: { 'content-type': 'application/json' },
+      })
+    }
+    const state = calls.length > 2 ? 'APPLIED' : 'UNCONFIRMED'
+    return new Response(JSON.stringify(configurationFixture({
+      revision: 12,
+      state,
+      confirmedAt: state === 'APPLIED' ? '2026-10-13T19:32:56.582Z' : null,
+    })), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    })
+  }, async () => {
+    const result = await retryAndWatchDeviceConfiguration(9, 12, csrfFixture, {
+      confirmRetry: () => true,
+      intervalMs: 1,
+      timeoutMs: 100,
+    })
+    assert.equal(result.state, 'APPLIED')
+  })
+  assert.equal(postCount, 1)
+  assert.deepEqual(calls.map(({ url }) => url), [
+    '/api/devices/9/configuration',
+    '/api/devices/9/configuration/12/retry',
+    '/api/devices/9/configuration',
+  ])
+})
+
+test('does not automatically repeat an uncertain same-revision retry and consults state', async (context) => {
+  await context.test('timeout', async () => {
+    let postCount = 0
+    let getCount = 0
+    await withFetch(async (_url, options) => {
+      if (options.method === 'POST') {
+        postCount += 1
+        return new Promise((_resolve, reject) => {
+          options.signal.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true })
+        })
+      }
+      getCount += 1
+      return new Response(JSON.stringify(configurationFixture({ state: 'UNCONFIRMED' })), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })
+    }, async () => {
+      await assert.rejects(retryAndWatchDeviceConfiguration(9, 7, csrfFixture, {
+        confirmRetry: () => true,
+        timeoutMs: 100,
+      }), (error) => error.name === 'TimeoutError')
+    })
+    assert.equal(postCount, 1)
+    assert.equal(getCount, 2)
+  })
+
+  await context.test('502', async () => {
+    let postCount = 0
+    let getCount = 0
+    await withFetch(async (_url, options) => {
+      if (options.method === 'POST') {
+        postCount += 1
+        return new Response(JSON.stringify({ detail: 'Orion indisponível' }), {
+          status: 502,
+          headers: { 'content-type': 'application/json' },
+        })
+      }
+      getCount += 1
+      return new Response(JSON.stringify(configurationFixture({ state: 'UNCONFIRMED' })), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })
+    }, async () => {
+      await assert.rejects(retryAndWatchDeviceConfiguration(9, 7, csrfFixture, {
+        confirmRetry: () => true,
+      }), (error) => error instanceof ApiError && error.status === 502)
+    })
+    assert.equal(postCount, 1)
+    assert.equal(getCount, 2)
+  })
+})
+
+test('surfaces retry conflicts without an automatic follow-up request', async () => {
+  let postCount = 0
+  let getCount = 0
+  await withFetch(async (_url, options) => {
+    if (options.method === 'POST') {
+      postCount += 1
+      return new Response(JSON.stringify({ detail: 'A revisão está bloqueada.' }), {
+        status: 409,
+        headers: { 'content-type': 'application/json' },
+      })
+    }
+    getCount += 1
+    return new Response(JSON.stringify(configurationFixture({ state: 'UNCONFIRMED' })), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    })
+  }, async () => {
+    await assert.rejects(retryAndWatchDeviceConfiguration(9, 7, csrfFixture, {
+      confirmRetry: () => true,
+    }), (error) => error instanceof ApiError && error.status === 409)
+  })
+  assert.equal(postCount, 1)
+  assert.equal(getCount, 1)
+})
+
+test('does not retry after preflight revision changes or state is not UNCONFIRMED', async (context) => {
+  for (const configuration of [
+    configurationFixture({ revision: 8, state: 'UNCONFIRMED' }),
+    configurationFixture({ state: 'APPLIED' }),
+    configurationFixture({ state: 'REJECTED', rejectionReason: 'INVALID_CONFIGURATION' }),
+    configurationFixture({ state: 'PENDING' }),
+  ]) {
+    await context.test(`${configuration.state} revision ${configuration.revision}`, async () => {
+      let postCount = 0
+      let confirmationCount = 0
+      await withFetch(async (_url, options) => {
+        if (options.method === 'POST') {
+          postCount += 1
+          return new Response(JSON.stringify(configuration), {
+            status: 202,
+            headers: { 'content-type': 'application/json' },
+          })
+        }
+        return new Response(JSON.stringify(configuration), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        })
+      }, async () => {
+        const latest = await retryAndWatchDeviceConfiguration(9, 7, csrfFixture, {
+          confirmRetry: () => { confirmationCount += 1; return true },
+        })
+        assert.equal(latest.revision, configuration.revision)
+      })
+      assert.equal(postCount, 0)
+      assert.equal(confirmationCount, 0)
+    })
+  }
+})
+
+test('cancels same-revision recovery before it can update the UI', async () => {
+  const controller = new AbortController()
+  const updatedDevices = []
+  let requestUrl = ''
+  let preflightStarted
+  const started = new Promise((resolve) => { preflightStarted = resolve })
+  await withFetch(async (url, { signal }) => {
+    requestUrl = url
+    preflightStarted()
+    return new Promise((_resolve, reject) => {
+      signal.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true })
+    })
+  }, async () => {
+    const recovery = retryAndWatchDeviceConfiguration(11, 7, csrfFixture, {
+      signal: controller.signal,
+      confirmRetry: () => true,
+      onUpdate: () => updatedDevices.push(11),
+    })
+    await started
+    controller.abort()
+    await assert.rejects(recovery, (error) => error.name === 'AbortError')
+  })
+  assert.equal(requestUrl, '/api/devices/11/configuration')
+  assert.deepEqual(updatedDevices, [])
+})
+
+test('keeps concurrent same-revision retries isolated by device id', async () => {
+  const updatedByDevice = { 11: [], 12: [] }
+  const requestedUrls = []
+  await withFetch(async (url, options) => {
+    requestedUrls.push(url)
+    const state = options.method === 'POST' ? 'APPLIED' : 'UNCONFIRMED'
+    return new Response(JSON.stringify(configurationFixture({
+      revision: 7,
+      state,
+      confirmedAt: state === 'APPLIED' ? '2026-10-13T19:32:56.582Z' : null,
+    })), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    })
+  }, async () => {
+    await Promise.all([11, 12].map((deviceId) => retryAndWatchDeviceConfiguration(deviceId, 7, csrfFixture, {
+      confirmRetry: () => true,
+      onUpdate: (configuration) => updatedByDevice[deviceId].push(configuration.state),
+    })))
+  })
+  assert.deepEqual(requestedUrls.sort(), [
+    '/api/devices/11/configuration',
+    '/api/devices/11/configuration/7/retry',
+    '/api/devices/12/configuration',
+    '/api/devices/12/configuration/7/retry',
+  ])
+  assert.deepEqual(updatedByDevice, { 11: ['UNCONFIRMED', 'APPLIED'], 12: ['UNCONFIRMED', 'APPLIED'] })
 })

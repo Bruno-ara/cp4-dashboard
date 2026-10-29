@@ -11,6 +11,7 @@ export const API_TIMEOUT_MS = readPositiveSetting(import.meta.env?.VITE_API_TIME
 export const API_REFRESH_INTERVAL_MS = readPositiveSetting(import.meta.env?.VITE_API_REFRESH_INTERVAL_MS, DEFAULT_REFRESH_INTERVAL_MS)
 
 const sessionExpirationListeners = new Set()
+const activeConfigurationRetries = new Set()
 
 export class ApiError extends Error {
   constructor(message, status, payload = null) {
@@ -134,7 +135,12 @@ async function responseError(response) {
     : payload && typeof payload === 'object'
       ? [payload.detail, payload.message, payload.title, payload.error].find((item) => typeof item === 'string' && item.trim() !== '')
       : ''
-  const fieldErrors = formatFieldErrors(payload?.fieldErrors || payload?.errors || payload?.violations)
+  const fieldErrors = [
+    ...formatFieldErrors(payload?.fields),
+    ...formatFieldErrors(payload?.fieldErrors),
+    ...formatFieldErrors(payload?.errors),
+    ...formatFieldErrors(payload?.violations),
+  ]
   const message = [
     `HTTP ${response.status}`,
     details,
@@ -143,9 +149,16 @@ async function responseError(response) {
   return new ApiError(message || `O backend respondeu com erro HTTP ${response.status}.`, response.status, payload)
 }
 
-async function request(path, { signal, timeoutMs = API_TIMEOUT_MS, protectedRequest = false, ...requestOptions } = {}) {
+async function request(path, {
+  signal,
+  timeoutMs = API_TIMEOUT_MS,
+  protectedRequest = false,
+  responseHandler,
+  ...requestOptions
+} = {}) {
   const controller = new AbortController()
   let timedOut = false
+  let processingResponse = false
   const abortFromCaller = () => controller.abort(signal.reason)
   if (signal?.aborted) abortFromCaller()
   else signal?.addEventListener('abort', abortFromCaller, { once: true })
@@ -164,9 +177,11 @@ async function request(path, { signal, timeoutMs = API_TIMEOUT_MS, protectedRequ
 
     if (!response.ok) {
       if (protectedRequest && response.status === 401) notifySessionExpired()
+      processingResponse = true
       throw await responseError(response)
     }
-    return response
+    processingResponse = true
+    return responseHandler ? await responseHandler(response) : response
   } catch (error) {
     if (timedOut) {
       const timeoutError = new Error(`A consulta ao backend excedeu o limite de ${timeoutMs / 1000} segundos. Tente novamente.`, { cause: error })
@@ -175,6 +190,7 @@ async function request(path, { signal, timeoutMs = API_TIMEOUT_MS, protectedRequ
     }
     if (signal?.aborted || error.name === 'AbortError') throw error
     if (error instanceof ApiError) throw error
+    if (processingResponse) throw error
     throw new Error('Não foi possível conectar ao backend. Verifique a configuração do proxy e tente novamente.', { cause: error })
   } finally {
     clearTimeout(timeout)
@@ -182,22 +198,28 @@ async function request(path, { signal, timeoutMs = API_TIMEOUT_MS, protectedRequ
   }
 }
 
-async function getJson(path, options, expectedStatus) {
-  const response = await request(path, options)
-  if (expectedStatus && response.status !== expectedStatus) {
-    const statusError = new ApiError(`Resposta inesperada do backend (HTTP ${response.status}; esperado HTTP ${expectedStatus}).`, response.status)
-    statusError.outcomeUnknown = response.ok
-    throw statusError
-  }
-  if (!response.headers.get('content-type')?.includes('application/json')) {
-    throw new Error('A resposta não está em JSON. Verifique se o proxy /api está configurado para o backend.')
-  }
-  try {
-    return await response.json()
-  } catch (error) {
-    if (options?.signal?.aborted || error.name === 'AbortError') throw error
-    throw new Error('O backend retornou uma resposta JSON inválida.', { cause: error })
-  }
+async function getJson(path, options, expectedStatus, includeStatus = false) {
+  return request(path, {
+    ...options,
+    responseHandler: async (response) => {
+      const expectedStatuses = Array.isArray(expectedStatus) ? expectedStatus : [expectedStatus]
+      if (expectedStatus && !expectedStatuses.includes(response.status)) {
+        const statusError = new ApiError(`Resposta inesperada do backend (HTTP ${response.status}; esperado HTTP ${expectedStatuses.join(' ou HTTP ')}).`, response.status)
+        statusError.outcomeUnknown = response.ok
+        throw statusError
+      }
+      if (!response.headers.get('content-type')?.includes('application/json')) {
+        throw new Error('A resposta não está em JSON. Verifique se o proxy /api está configurado para o backend.')
+      }
+      try {
+        const data = await response.json()
+        return includeStatus ? { status: response.status, data } : data
+      } catch (error) {
+        if (options?.signal?.aborted || error.name === 'AbortError') throw error
+        throw new Error('O backend retornou uma resposta JSON inválida.', { cause: error })
+      }
+    },
+  })
 }
 
 function validateCsrfToken(data) {
@@ -228,12 +250,14 @@ function hasOneDecimalPlace(value) {
 
 export function validateDeviceConfigurationValues(configuration) {
   const { temperatureMin, temperatureMax, humidityMin, humidityMax, luminosityMax } = configuration || {}
+  const temperatureSpanTenths = Math.round(temperatureMax * 10) - Math.round(temperatureMin * 10)
+  const humiditySpanTenths = Math.round(humidityMax * 10) - Math.round(humidityMin * 10)
   if (!hasOneDecimalPlace(temperatureMin) || temperatureMin < -20 || temperatureMin > 60 ||
       !hasOneDecimalPlace(temperatureMax) || temperatureMax < -20 || temperatureMax > 60 ||
-      temperatureMax - temperatureMin <= 2 ||
+      temperatureSpanTenths <= 20 ||
       !hasOneDecimalPlace(humidityMin) || humidityMin < 0 || humidityMin > 100 ||
       !hasOneDecimalPlace(humidityMax) || humidityMax < 0 || humidityMax > 100 ||
-      humidityMax - humidityMin <= 6 ||
+      humiditySpanTenths <= 60 ||
       !Number.isInteger(luminosityMax) || luminosityMax < 200 || luminosityMax > 4095) {
     throw new Error('Revise os limites: temperatura de −20 a 60 °C (intervalo maior que 2 °C), umidade de 0 a 100% (intervalo maior que 6 pontos) e luminosidade inteira de 200 a 4095 ADC. Temperatura e umidade aceitam no máximo uma casa decimal.')
   }
@@ -499,6 +523,30 @@ export async function getDeviceConfiguration(deviceId, options) {
   }))
 }
 
+function validateConfigurationRevision(revision) {
+  if (!((typeof revision === 'string' && revision.trim() !== '') || (Number.isInteger(revision) && revision > 0))) {
+    throw new Error('A revisão da configuração deve ser conhecida.')
+  }
+  return String(revision)
+}
+
+export async function retryDeviceConfiguration(deviceId, revision, csrf, options) {
+  validateDeviceId(deviceId)
+  const revisionPath = encodeURIComponent(validateConfigurationRevision(revision))
+  const { status, data } = await getJson(`/api/devices/${deviceId}/configuration/${revisionPath}/retry`, {
+    ...options,
+    method: 'POST',
+    headers: withCsrfHeaders(csrf),
+    protectedRequest: true,
+  }, [200, 202], true)
+  const configuration = validateDeviceConfiguration(data)
+  const expectedState = status === 200 ? 'APPLIED' : 'PENDING'
+  if (configuration.state !== expectedState) {
+    throw new Error('A resposta do reenvio não corresponde ao estado HTTP informado.')
+  }
+  return configuration
+}
+
 export async function createDeviceConfiguration(deviceId, values, csrf, options) {
   validateDeviceId(deviceId)
   const configuration = validateDeviceConfigurationValues(values)
@@ -591,6 +639,63 @@ export async function watchDeviceConfiguration(deviceId, {
   const unknownError = new Error('A API ainda não retornou a revisão correspondente a esta solicitação.')
   unknownError.name = 'ConfigurationOutcomeUnknownError'
   throw unknownError
+}
+
+export async function retryAndWatchDeviceConfiguration(deviceId, revision, csrf, {
+  signal,
+  intervalMs = 5000,
+  timeoutMs = 45000,
+  confirmRetry,
+  onRetryAccepted,
+  onUpdate,
+} = {}) {
+  validateDeviceId(deviceId)
+  const requestedRevision = validateConfigurationRevision(revision)
+  const latest = await getDeviceConfiguration(deviceId, { signal })
+  onUpdate?.(latest)
+  if (String(latest.revision) !== requestedRevision || latest.state !== 'UNCONFIRMED') return latest
+  if (typeof confirmRetry !== 'function' || !(await confirmRetry(latest))) return latest
+  if (activeConfigurationRetries.has(deviceId)) {
+    throw new Error('Já existe um reenvio desta revisão em andamento para este dispositivo.')
+  }
+  activeConfigurationRetries.add(deviceId)
+  try {
+    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError')
+
+    let retried
+    try {
+      retried = await retryDeviceConfiguration(deviceId, requestedRevision, csrf, { signal, timeoutMs })
+    } catch (error) {
+      const outcomeNeedsReconciliation = error.name === 'TimeoutError' ||
+        error.outcomeUnknown === true ||
+        (error instanceof ApiError && error.status === 502) ||
+        error.message.startsWith('Não foi possível conectar ao backend.')
+      if (!outcomeNeedsReconciliation || signal?.aborted) throw error
+      try {
+        onUpdate?.(await getDeviceConfiguration(deviceId, { signal }))
+      } catch (verificationError) {
+        if (verificationError.name === 'AbortError') throw verificationError
+        throw new Error(`${error.message} A consulta de estado também falhou: ${verificationError.message}`, { cause: error })
+      }
+      throw error
+    }
+
+    onRetryAccepted?.(retried)
+    onUpdate?.(retried)
+    if (retried.state === 'APPLIED') return retried
+    if (String(retried.revision) !== requestedRevision) {
+      throw new Error('A API retornou uma revisão diferente da solicitada para reenvio.')
+    }
+    return watchDeviceConfiguration(deviceId, {
+      signal,
+      intervalMs,
+      timeoutMs,
+      expectedRevision: requestedRevision,
+      onUpdate,
+    })
+  } finally {
+    activeConfigurationRetries.delete(deviceId)
+  }
 }
 
 export async function submitAndWatchDeviceConfiguration(deviceId, values, csrf, {

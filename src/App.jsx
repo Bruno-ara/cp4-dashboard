@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { API_REFRESH_INTERVAL_MS, ApiError, createDevice, createEnvironment, deleteDevice, getCsrfToken, getCurrentReadings, getDeviceConfiguration, getDeviceLimits, getDevices, getEnvironments, getSensorHistory, getSession, login, logout as endSession, provisionDevice, saveDeviceLimit, sendDeviceAlert, subscribeToSessionExpiration, submitAndWatchDeviceConfiguration, validateDeviceConfigurationValues, watchDeviceConfiguration } from './api.js'
+import { API_REFRESH_INTERVAL_MS, ApiError, createDevice, createEnvironment, deleteDevice, getCsrfToken, getCurrentReadings, getDeviceConfiguration, getDeviceLimits, getDevices, getEnvironments, getSensorHistory, getSession, login, logout as endSession, provisionDevice, retryAndWatchDeviceConfiguration, saveDeviceLimit, sendDeviceAlert, subscribeToSessionExpiration, submitAndWatchDeviceConfiguration, validateDeviceConfigurationValues, watchDeviceConfiguration } from './api.js'
 import VineyardMap, { VineyardDetails } from './VineyardMap.jsx'
 
 const metrics = {
@@ -214,6 +214,7 @@ function DeviceConfigurationPanel({
   needsVerification,
   onSubmit,
   onVerify,
+  onRetryRevision,
 }) {
   const [values, setValues] = useState({
     temperatureMin: '',
@@ -305,9 +306,16 @@ function DeviceConfigurationPanel({
           <button className="primary-button" type="submit" disabled={busy || loading || tracking || blocked}>
             {busy ? 'Enviando…' : configuration ? 'Enviar nova revisão' : 'Enviar configuração'}
           </button>
-          {(needsVerification || timedOut || displayState === 'UNCONFIRMED') && (
+          {(needsVerification || timedOut || displayState === 'UNCONFIRMED' || configuration?.state === 'PENDING') && (
             <button className="secondary-button" type="button" onClick={onVerify} disabled={loading || busy || tracking}>
               Verificar novamente
+            </button>
+          )}
+          {configuration?.state === 'UNCONFIRMED' &&
+            ((typeof configuration.revision === 'string' && configuration.revision.trim() !== '') ||
+              (Number.isInteger(configuration.revision) && configuration.revision > 0)) && (
+            <button className="secondary-button" type="button" onClick={onRetryRevision} disabled={loading || busy || tracking}>
+              Reenviar mesma revisão
             </button>
           )}
           {tracking && <span className="configuration-wait" role="status">Acompanhando confirmação (somente GET)…</span>}
@@ -389,6 +397,8 @@ function App() {
   const lastSessionCheckRef = useRef(0)
   const configurationControllerRef = useRef(null)
   const selectedConfigurationDeviceRef = useRef(null)
+
+  useEffect(() => () => configurationControllerRef.current?.abort(), [])
 
   const cancelConfigurationTracking = useCallback(() => {
     configurationControllerRef.current?.abort()
@@ -991,6 +1001,66 @@ function App() {
     }
   }
 
+  const handleRetryConfigurationRevision = async () => {
+    const current = deviceConfiguration
+    const deviceId = activeLimitDevice
+    if (deviceId === null || configurationBusy || current?.state !== 'UNCONFIRMED' ||
+        !((typeof current.revision === 'string' && current.revision.trim() !== '') ||
+          (Number.isInteger(current.revision) && current.revision > 0)) ||
+        configurationControllerRef.current) return
+
+    const controller = new AbortController()
+    configurationControllerRef.current = controller
+    selectedConfigurationDeviceRef.current = deviceId
+    const isCurrent = () => !controller.signal.aborted &&
+      configurationControllerRef.current === controller &&
+      selectedConfigurationDeviceRef.current === deviceId
+    setConfigurationBusy(true)
+    setConfigurationLoading(true)
+    setConfigurationTracking(false)
+    setConfigurationError('')
+    setConfigurationSubmissionError('')
+    setConfigurationTimedOut(false)
+
+    let retryAccepted = false
+    try {
+      const latest = await retryAndWatchDeviceConfiguration(deviceId, current.revision, csrf, {
+        signal: controller.signal,
+        confirmRetry: (configuration) => window.confirm(
+          `A revisão ${configuration.revision} permanece não confirmada. Reenviar os valores armazenados pelo backend?\n\nTemperatura: ${configuration.temperatureMin}–${configuration.temperatureMax} °C\nUmidade: ${configuration.humidityMin}–${configuration.humidityMax}%\nLuminosidade máxima: ${configuration.luminosityMax} ADC\n\nOs valores editados no formulário não serão usados.`,
+        ),
+        onRetryAccepted: (configuration) => {
+          if (isCurrent()) {
+            retryAccepted = true
+            setConfigurationLoading(false)
+            setConfigurationTracking(configuration.state === 'PENDING')
+          }
+        },
+        onUpdate: (configuration) => {
+          if (isCurrent()) {
+            setDeviceConfiguration(configuration)
+            setConfigurationNeedsVerification(configuration.state === 'UNCONFIRMED')
+          }
+        },
+      })
+      if (!isCurrent()) return
+      setDeviceConfiguration(latest)
+      const unresolved = latest.state === 'PENDING' || latest.state === 'UNCONFIRMED'
+      setConfigurationTimedOut(retryAccepted && unresolved)
+      setConfigurationNeedsVerification(latest.state === 'UNCONFIRMED' || (retryAccepted && latest.state === 'PENDING'))
+    } catch (error) {
+      if (!isCurrent() || error.name === 'AbortError') return
+      setConfigurationSubmissionError(error.message)
+    } finally {
+      if (isCurrent()) {
+        setConfigurationBusy(false)
+        setConfigurationLoading(false)
+        setConfigurationTracking(false)
+        configurationControllerRef.current = null
+      }
+    }
+  }
+
   const currentValues = useMemo(() => ({
     temperature: readings?.temperature,
     humidity: readings?.humidity,
@@ -1234,6 +1304,7 @@ function App() {
               needsVerification={configurationNeedsVerification}
               onSubmit={handleConfigurationSubmit}
               onVerify={handleVerifyConfiguration}
+              onRetryRevision={handleRetryConfigurationRevision}
             />
           </div>}
 

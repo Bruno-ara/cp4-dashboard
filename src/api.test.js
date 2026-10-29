@@ -3,9 +3,12 @@ import test from 'node:test'
 import {
   ApiError,
   createDevice,
+  createDeviceConfiguration,
   createEnvironment,
+  deleteDevice,
   getCsrfToken,
   getCurrentReadings,
+  getDeviceConfiguration,
   getDeviceLimits,
   getDevices,
   getEnvironments,
@@ -13,8 +16,13 @@ import {
   getSession,
   login,
   logout,
+  provisionDevice,
   saveDeviceLimit,
+  sendDeviceAlert,
   subscribeToSessionExpiration,
+  submitAndWatchDeviceConfiguration,
+  validateDeviceConfigurationValues,
+  watchDeviceConfiguration,
 } from './api.js'
 
 const currentFixture = {
@@ -205,12 +213,13 @@ test('expires the open dashboard on protected 401 without treating session check
   }
 })
 
-test('uses the Java environment, device, and limit contracts', async () => {
+test('uses CSRF-protected Java environment, device, and limit contracts', async () => {
   const environment = { id: 2, name: 'Adega principal', description: 'Setor norte' }
   const device = {
     id: 9,
     name: 'WineGuard 002',
-    fiwareId: 'wine002',
+    fiwareId: 'WineSensor002',
+    mqttDeviceId: 'wine002',
     fiwareType: 'WineSensor002',
     fiwareService: 'vinheria',
     fiwareServicePath: '/',
@@ -219,6 +228,7 @@ test('uses the Java environment, device, and limit contracts', async () => {
     active: true,
   }
   const limit = { id: 12, deviceId: device.id, metric: 'TEMPERATURE', minimumValue: 10, maximumValue: 18, unit: '°C' }
+  const csrf = { headerName: 'X-CSRF-TOKEN', token: 'csrf-in-memory' }
   const calls = []
 
   await withFetch(async (url, options) => {
@@ -234,24 +244,25 @@ test('uses the Java environment, device, and limit contracts', async () => {
     })
   }, async () => {
     assert.deepEqual(await getEnvironments(), [environment])
-    assert.deepEqual(await createEnvironment({ name: 'Adega principal', description: 'Setor norte' }), environment)
-    assert.deepEqual(await createEnvironment({ name: 'Adega sem descrição' }), environment)
+    assert.deepEqual(await createEnvironment({ name: 'Adega principal', description: 'Setor norte' }, csrf), environment)
+    assert.deepEqual(await createEnvironment({ name: 'Adega sem descrição' }, csrf), environment)
     assert.deepEqual(await getDevices(), [device])
     assert.deepEqual(await createDevice({
       name: device.name,
       fiwareId: device.fiwareId,
+      mqttDeviceId: device.mqttDeviceId,
       fiwareType: device.fiwareType,
       fiwareService: device.fiwareService,
       fiwareServicePath: device.fiwareServicePath,
       environmentId: device.environmentId,
-    }), device)
+    }, csrf), device)
     assert.deepEqual(await getDeviceLimits(device.id), [limit])
     assert.deepEqual(await saveDeviceLimit(device.id, {
       metric: limit.metric,
       minimumValue: limit.minimumValue,
       maximumValue: limit.maximumValue,
       unit: limit.unit,
-    }), limit)
+    }, csrf), limit)
   })
 
   assert.deepEqual(calls.map(({ url, options }) => [url, options.method || 'GET']), [
@@ -264,16 +275,21 @@ test('uses the Java environment, device, and limit contracts', async () => {
     ['/api/devices/9/limits', 'PUT'],
   ])
   assert.equal(calls[1].options.headers['Content-Type'], 'application/json')
+  assert.equal(calls[1].options.headers['X-CSRF-TOKEN'], csrf.token)
   assert.deepEqual(JSON.parse(calls[1].options.body), { name: environment.name, description: environment.description })
   assert.deepEqual(JSON.parse(calls[2].options.body), { name: 'Adega sem descrição', description: null })
+  assert.equal(calls[2].options.headers['X-CSRF-TOKEN'], csrf.token)
   assert.deepEqual(JSON.parse(calls[4].options.body), {
     name: device.name,
     fiwareId: device.fiwareId,
+    mqttDeviceId: device.mqttDeviceId,
     fiwareType: device.fiwareType,
     fiwareService: device.fiwareService,
     fiwareServicePath: device.fiwareServicePath,
     environmentId: device.environmentId,
   })
+  assert.equal(calls[4].options.headers['X-CSRF-TOKEN'], csrf.token)
+  assert.equal(calls[6].options.headers['X-CSRF-TOKEN'], csrf.token)
   assert.equal(calls.every(({ options }) => options.credentials === 'same-origin'), true)
 })
 
@@ -282,11 +298,29 @@ test('rejects invalid environment, device, and limit inputs before sending reque
   await assert.rejects(createDevice({
     name: 'Sensor',
     fiwareId: 'wine002',
+    mqttDeviceId: 'wine002',
     fiwareType: 'WineSensor002',
     fiwareService: 'vinheria',
     fiwareServicePath: '/',
     environmentId: 0,
   }), /ambiente válido/)
+  await assert.rejects(createDevice({
+    name: 'Sensor',
+    fiwareId: 'WineSensor002',
+    mqttDeviceId: 'not valid',
+    fiwareType: 'WineSensor002',
+    fiwareService: 'vinheria',
+    fiwareServicePath: '/',
+    environmentId: 1,
+  }), /ID MQTT/)
+  await assert.rejects(createDevice({
+    name: 'Sensor',
+    fiwareId: 'WineSensor002',
+    fiwareType: 'WineSensor002',
+    fiwareService: 'vinheria',
+    fiwareServicePath: '/',
+    environmentId: 1,
+  }), /dados do dispositivo/)
   await assert.rejects(getDeviceLimits(0), /inteiro positivo/)
   await assert.rejects(saveDeviceLimit(1, {
     metric: 'TEMPERATURE',
@@ -294,4 +328,306 @@ test('rejects invalid environment, device, and limit inputs before sending reque
     maximumValue: null,
     unit: '°C',
   }), /ao menos um limite válido/)
+})
+
+const csrfFixture = { headerName: 'X-CSRF-TOKEN', token: 'csrf-in-memory' }
+const validConfigurationValues = {
+  temperatureMin: 15,
+  temperatureMax: 29,
+  humidityMin: 40,
+  humidityMax: 82,
+  luminosityMax: 3500,
+}
+
+function configurationFixture(overrides = {}) {
+  return {
+    revision: 7,
+    ...validConfigurationValues,
+    state: 'PENDING',
+    createdAt: '2026-10-13T19:31:56.582Z',
+    confirmedAt: null,
+    rejectionReason: null,
+    ...overrides,
+  }
+}
+
+test('sends CSRF on provision, delete, alert, and complete configuration writes', async () => {
+  const calls = []
+  await withFetch(async (url, options) => {
+    calls.push({ url, options })
+    if (url.endsWith('/provision')) return new Response(null, { status: 201 })
+    if (options.method === 'DELETE') return new Response(null, { status: 204 })
+    if (url.endsWith('/commands/alert')) return new Response(null, { status: 202 })
+    return new Response(JSON.stringify(configurationFixture()), {
+      status: 202,
+      headers: { 'content-type': 'application/json' },
+    })
+  }, async () => {
+    await provisionDevice(9, csrfFixture)
+    await deleteDevice(9, csrfFixture)
+    await sendDeviceAlert(9, 'temperature', csrfFixture)
+    await createDeviceConfiguration(9, validConfigurationValues, csrfFixture)
+  })
+
+  assert.deepEqual(calls.map(({ url, options }) => [url, options.method]), [
+    ['/api/devices/9/provision', 'POST'],
+    ['/api/devices/9', 'DELETE'],
+    ['/api/devices/9/commands/alert', 'POST'],
+    ['/api/devices/9/configuration', 'POST'],
+  ])
+  for (const { options } of calls) assert.equal(options.headers['X-CSRF-TOKEN'], csrfFixture.token)
+  assert.equal(calls[0].options.body, undefined)
+  assert.deepEqual(JSON.parse(calls[2].options.body), { command: 'temperature' })
+  assert.deepEqual(JSON.parse(calls[3].options.body), validConfigurationValues)
+})
+
+test('accepts DELETE 204 without attempting to parse a response body', async () => {
+  await withFetch(async (_url, options) => {
+    assert.equal(options.method, 'DELETE')
+    return new Response(null, { status: 204 })
+  }, async () => {
+    await assert.doesNotReject(deleteDevice(9, csrfFixture))
+  })
+})
+
+test('validates complete ESP configuration bounds and decimal precision without rounding', async () => {
+  assert.deepEqual(validateDeviceConfigurationValues(validConfigurationValues), validConfigurationValues)
+  assert.deepEqual(validateDeviceConfigurationValues({
+    ...validConfigurationValues,
+    temperatureMin: -20,
+    temperatureMax: -17.9,
+    humidityMin: 0,
+    humidityMax: 6.1,
+    luminosityMax: 4095,
+  }), {
+    ...validConfigurationValues,
+    temperatureMin: -20,
+    temperatureMax: -17.9,
+    humidityMin: 0,
+    humidityMax: 6.1,
+    luminosityMax: 4095,
+  })
+  for (const invalid of [
+    { ...validConfigurationValues, temperatureMin: 15.01 },
+    { ...validConfigurationValues, temperatureMax: 17 },
+    { ...validConfigurationValues, humidityMin: 40.01 },
+    { ...validConfigurationValues, humidityMax: 46 },
+    { ...validConfigurationValues, luminosityMax: 3500.5 },
+    { ...validConfigurationValues, luminosityMax: 199 },
+  ]) {
+    assert.throws(() => validateDeviceConfigurationValues(invalid), /Revise os limites/)
+  }
+})
+
+test('validates configuration states and returns confirmation metadata', async () => {
+  const states = ['PENDING', 'APPLIED', 'REJECTED', 'UNCONFIRMED']
+  await withFetch(async () => {
+    const state = states.shift()
+    const configuration = configurationFixture({
+      state,
+      confirmedAt: state === 'APPLIED' ? '2026-10-13T19:32:56.582Z' : null,
+      rejectionReason: state === 'REJECTED' ? 'INVALID_CONFIGURATION' : null,
+    })
+    return new Response(JSON.stringify(configuration), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    })
+  }, async () => {
+    const pending = await getDeviceConfiguration(9)
+    assert.equal(pending.state, 'PENDING')
+    const applied = await getDeviceConfiguration(9)
+    assert.equal(applied.state, 'APPLIED')
+    assert.equal(applied.confirmedAt, '2026-10-13T19:32:56.582Z')
+    const rejected = await getDeviceConfiguration(9)
+    assert.equal(rejected.rejectionReason, 'INVALID_CONFIGURATION')
+    const unconfirmed = await getDeviceConfiguration(9)
+    assert.equal(unconfirmed.state, 'UNCONFIRMED')
+  })
+})
+
+test('watches for a late ESP confirmation using sequential GET requests', async () => {
+  let activeRequests = 0
+  let maximumActiveRequests = 0
+  let reads = 0
+  await withFetch(async () => {
+    activeRequests += 1
+    maximumActiveRequests = Math.max(maximumActiveRequests, activeRequests)
+    await new Promise((resolve) => setTimeout(resolve, 2))
+    reads += 1
+    activeRequests -= 1
+    return new Response(JSON.stringify(configurationFixture(
+      reads === 1
+        ? { state: 'PENDING' }
+        : { state: 'APPLIED', confirmedAt: '2026-10-13T19:32:56.582Z' },
+    )), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    })
+  }, async () => {
+    const result = await watchDeviceConfiguration(9, { intervalMs: 1, timeoutMs: 100 })
+    assert.equal(result.state, 'APPLIED')
+    assert.equal(result.confirmedAt, '2026-10-13T19:32:56.582Z')
+  })
+  assert.equal(reads, 2)
+  assert.equal(maximumActiveRequests, 1)
+})
+
+test('does not repeat configuration POST after an ambiguous failure and reconciles by GET', async () => {
+  let postCount = 0
+  let getCount = 0
+  await withFetch(async (_url, options) => {
+    if (options.method === 'POST') {
+      postCount += 1
+      return new Response(JSON.stringify({ message: 'gateway timeout' }), {
+        status: 502,
+        headers: { 'content-type': 'application/json' },
+      })
+    }
+    getCount += 1
+    const state = getCount === 1 ? 'PENDING' : 'APPLIED'
+    return new Response(JSON.stringify(configurationFixture({
+      state,
+      confirmedAt: state === 'APPLIED' ? '2026-10-13T19:32:56.582Z' : null,
+    })), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    })
+  }, async () => {
+    const result = await submitAndWatchDeviceConfiguration(9, validConfigurationValues, csrfFixture, {
+      intervalMs: 1,
+      timeoutMs: 100,
+    })
+    assert.equal(result.state, 'APPLIED')
+  })
+  assert.equal(postCount, 1)
+  assert.equal(getCount, 2)
+})
+
+test('reconciles an unexpected successful POST status without allowing a second write', async () => {
+  let postCount = 0
+  await withFetch(async (_url, options) => {
+    if (options.method === 'POST') {
+      postCount += 1
+      return new Response(JSON.stringify(configurationFixture()), {
+        status: 201,
+        headers: { 'content-type': 'application/json' },
+      })
+    }
+    return new Response(JSON.stringify(configurationFixture({
+      state: 'APPLIED',
+      confirmedAt: '2026-10-13T19:32:56.582Z',
+    })), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    })
+  }, async () => {
+    const result = await submitAndWatchDeviceConfiguration(9, validConfigurationValues, csrfFixture)
+    assert.equal(result.state, 'APPLIED')
+  })
+  assert.equal(postCount, 1)
+})
+
+test('does not treat an older applied revision as confirmation after a failed POST', async () => {
+  let postCount = 0
+  let getCount = 0
+  await withFetch(async (_url, options) => {
+    if (options.method === 'POST') {
+      postCount += 1
+      return new Response(JSON.stringify({ message: 'gateway timeout' }), {
+        status: 502,
+        headers: { 'content-type': 'application/json' },
+      })
+    }
+    getCount += 1
+    return new Response(JSON.stringify(configurationFixture({
+      state: 'APPLIED',
+      confirmedAt: '2026-10-13T19:32:56.582Z',
+    })), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    })
+  }, async () => {
+    await assert.rejects(
+      submitAndWatchDeviceConfiguration(9, validConfigurationValues, csrfFixture, {
+        previousRevision: 7,
+        intervalMs: 1,
+        timeoutMs: 6,
+      }),
+      (error) => error.name === 'ConfigurationOutcomeUnknownError',
+    )
+  })
+  assert.equal(postCount, 1)
+  assert.ok(getCount > 1)
+})
+
+test('cancels configuration polling without issuing another GET', async () => {
+  const controller = new AbortController()
+  let getCount = 0
+  await withFetch(async () => {
+    getCount += 1
+    return new Response(JSON.stringify(configurationFixture()), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    })
+  }, async () => {
+    const watch = watchDeviceConfiguration(9, { signal: controller.signal, intervalMs: 100, timeoutMs: 1000 })
+    controller.abort()
+    await assert.rejects(watch, (error) => error.name === 'AbortError')
+  })
+  assert.equal(getCount, 0)
+})
+
+test('bounds configuration polling by the requested timeout, including an in-flight GET', async () => {
+  let getCount = 0
+  await withFetch((_url, { signal }) => {
+    getCount += 1
+    return new Promise((_resolve, reject) => {
+      signal.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true })
+    })
+  }, async () => {
+    const startedAt = Date.now()
+    await assert.rejects(
+      watchDeviceConfiguration(9, { intervalMs: 1, timeoutMs: 20 }),
+      (error) => error.name === 'TimeoutError',
+    )
+    assert.ok(Date.now() - startedAt < 100)
+  })
+  assert.equal(getCount, 1)
+})
+
+test('keeps configuration requests isolated by device id', async () => {
+  const requestedUrls = []
+  await withFetch(async (url) => {
+    requestedUrls.push(url)
+    return new Response(JSON.stringify(configurationFixture({ revision: Number(url.match(/devices\/(\d+)/)[1]) })), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    })
+  }, async () => {
+    const [deviceOne, deviceTwo] = await Promise.all([
+      getDeviceConfiguration(1),
+      getDeviceConfiguration(2),
+    ])
+    assert.equal(deviceOne.revision, 1)
+    assert.equal(deviceTwo.revision, 2)
+  })
+  assert.deepEqual(requestedUrls.sort(), [
+    '/api/devices/1/configuration',
+    '/api/devices/2/configuration',
+  ])
+})
+
+test('includes backend field validation details in API errors', async () => {
+  await withFetch(async () => new Response(JSON.stringify({
+    message: 'Dados inválidos',
+    fieldErrors: { temperatureMin: ['deve ser maior ou igual a -20'] },
+  }), {
+    status: 400,
+    headers: { 'content-type': 'application/json' },
+  }), async () => {
+    await assert.rejects(createDeviceConfiguration(9, validConfigurationValues, csrfFixture), (error) =>
+      error instanceof ApiError &&
+      error.status === 400 &&
+      /temperatureMin: deve ser maior ou igual a -20/.test(error.message))
+  })
 })

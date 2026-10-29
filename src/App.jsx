@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { API_REFRESH_INTERVAL_MS, ApiError, createDevice, createEnvironment, getCsrfToken, getCurrentReadings, getDeviceLimits, getDevices, getEnvironments, getSensorHistory, getSession, login, logout as endSession, saveDeviceLimit, subscribeToSessionExpiration } from './api.js'
+import { API_REFRESH_INTERVAL_MS, ApiError, createDevice, createEnvironment, deleteDevice, getCsrfToken, getCurrentReadings, getDeviceConfiguration, getDeviceLimits, getDevices, getEnvironments, getSensorHistory, getSession, login, logout as endSession, provisionDevice, saveDeviceLimit, sendDeviceAlert, subscribeToSessionExpiration, submitAndWatchDeviceConfiguration, validateDeviceConfigurationValues, watchDeviceConfiguration } from './api.js'
 import VineyardMap, { VineyardDetails } from './VineyardMap.jsx'
 
 const metrics = {
@@ -12,6 +12,38 @@ const deviceMetrics = {
   TEMPERATURE: { label: 'Temperatura' },
   HUMIDITY: { label: 'Umidade' },
   LUMINOSITY: { label: 'Luminosidade' },
+}
+
+const configurationFields = [
+  { key: 'temperatureMin', label: 'Temperatura mínima', unit: '°C', min: -20, max: 60 },
+  { key: 'temperatureMax', label: 'Temperatura máxima', unit: '°C', min: -20, max: 60 },
+  { key: 'humidityMin', label: 'Umidade mínima', unit: '%', min: 0, max: 100 },
+  { key: 'humidityMax', label: 'Umidade máxima', unit: '%', min: 0, max: 100 },
+  { key: 'luminosityMax', label: 'Luminosidade máxima', unit: 'ADC', min: 200, max: 4095, step: 1 },
+]
+
+const configurationStatusLabels = {
+  PENDING: 'Pendente — aguardando confirmação do ESP',
+  APPLIED: 'Aplicada no ESP',
+  REJECTED: 'Rejeitada pelo ESP',
+  UNCONFIRMED: 'Não confirmada — resultado ainda desconhecido',
+}
+
+function translateRejectionReason(reason) {
+  const normalized = reason?.trim().toUpperCase()
+  const translations = {
+    INVALID_CONFIGURATION: 'Os valores da configuração foram rejeitados.',
+    INVALID_TEMPERATURE_RANGE: 'A faixa de temperatura foi rejeitada pelo dispositivo.',
+    INVALID_HUMIDITY_RANGE: 'A faixa de umidade foi rejeitada pelo dispositivo.',
+    INVALID_LUMINOSITY_MAX: 'O limite de luminosidade foi rejeitado pelo dispositivo.',
+    DEVICE_NOT_FOUND: 'O dispositivo não foi encontrado.',
+    DEVICE_OFFLINE: 'O dispositivo não está conectado.',
+    MQTT_UNAVAILABLE: 'O dispositivo não está disponível na comunicação MQTT.',
+    INVALID_PAYLOAD: 'O dispositivo não reconheceu os parâmetros recebidos.',
+    OUT_OF_RANGE: 'Um ou mais parâmetros estão fora da faixa aceita pelo dispositivo.',
+    TIMEOUT: 'O dispositivo não confirmou a configuração dentro do prazo.',
+  }
+  return translations[normalized] || `A configuração foi rejeitada pelo ESP. Motivo informado pela API: ${reason}.`
 }
 
 const formatValue = (value, digits = 1) => {
@@ -170,6 +202,121 @@ function LimitEditor({ deviceId, metric, current, busy, onSave }) {
   )
 }
 
+function DeviceConfigurationPanel({
+  deviceId,
+  configuration,
+  loading,
+  error,
+  submissionError,
+  busy,
+  tracking,
+  timedOut,
+  needsVerification,
+  onSubmit,
+  onVerify,
+}) {
+  const [values, setValues] = useState({
+    temperatureMin: '',
+    temperatureMax: '',
+    humidityMin: '',
+    humidityMax: '',
+    luminosityMax: '',
+  })
+  const [validationError, setValidationError] = useState('')
+  const displayState = needsVerification || (timedOut && configuration?.state === 'PENDING')
+    ? 'UNCONFIRMED'
+    : configuration?.state
+  const blocked = ['PENDING', 'UNCONFIRMED'].includes(displayState) || needsVerification
+
+  const submit = (event) => {
+    event.preventDefault()
+    try {
+      if (Object.values(values).some((value) => value === '')) {
+        throw new Error('Preencha todos os valores da configuração do ESP.')
+      }
+      const validated = validateDeviceConfigurationValues(Object.fromEntries(
+        Object.entries(values).map(([field, value]) => [field, Number(value)]),
+      ))
+      setValidationError('')
+      onSubmit(validated)
+    } catch (error) {
+      setValidationError(error.message)
+    }
+  }
+
+  const readOnlyValues = configuration && configurationFields.map((field) => (
+    <div className="configuration-value" key={field.key}>
+      <span>{field.label}</span>
+      <strong>{formatValue(configuration[field.key], 1)} {field.unit}</strong>
+    </div>
+  ))
+
+  return (
+    <section className="panel management-panel esp-configuration" aria-labelledby={`configuration-title-${deviceId}`}>
+      <div className="panel-heading">
+        <div>
+          <h2 id={`configuration-title-${deviceId}`}>Configuração do ESP</h2>
+          <p>Envio completo de parâmetros para o dispositivo {deviceId}</p>
+        </div>
+        {configuration && <span className={`configuration-status status-${displayState.toLowerCase()}`}>{configurationStatusLabels[displayState]}</span>}
+      </div>
+      <p className="management-notice">Esta operação solicita ao ESP a aplicação de todos os parâmetros. Os valores só são considerados ativos após confirmação APPLIED pela API Java.</p>
+      {configuration && (
+        <div className="configuration-record">
+          <div className="configuration-metadata">
+            <span>Revisão <strong>{configuration.revision}</strong></span>
+            <span>Solicitada em <strong>{formatTimestamp(configuration.createdAt)}</strong></span>
+            <span>Confirmada em <strong>{configuration.confirmedAt ? formatTimestamp(configuration.confirmedAt) : 'Ainda não confirmada'}</strong></span>
+          </div>
+          <div className="configuration-values">
+            <div className="configuration-values-title">Valores solicitados</div>
+            {readOnlyValues}
+          </div>
+          {displayState === 'APPLIED' && <div className="configuration-applied-note" role="status">A API confirmou esta revisão como aplicada no ESP. {readOnlyValues}</div>}
+          {configuration.state === 'REJECTED' && configuration.rejectionReason && <p className="form-error configuration-rejection" role="alert">{translateRejectionReason(configuration.rejectionReason)}</p>}
+        </div>
+      )}
+      {loading && <div className="request-message" role="status">Consultando estado atual da configuração…</div>}
+      {error && <p className="form-error" role="alert">{error}</p>}
+      {submissionError && <p className="form-error" role="alert">{submissionError}</p>}
+      {timedOut && <p className="configuration-note" role="status">A confirmação não chegou em 45 segundos. A configuração não foi reenviada; consulte o estado da revisão.</p>}
+      {needsVerification && !configuration && <p className="configuration-note" role="status">O resultado do envio é desconhecido. Verifique o estado antes de iniciar uma nova configuração; nenhum POST será repetido automaticamente.</p>}
+      <form className="configuration-form" onSubmit={submit}>
+        <h3>{configuration ? 'Nova revisão de configuração' : 'Enviar configuração completa'}</h3>
+        <div className="configuration-fields">
+          {configurationFields.map((field) => (
+            <label key={field.key}>{field.label} ({field.unit})
+              <input
+                type="number"
+                min={field.min}
+                max={field.max}
+                step={field.step || 0.1}
+                value={values[field.key]}
+                onChange={(event) => setValues((current) => ({ ...current, [field.key]: event.target.value }))}
+                required
+                disabled={busy || blocked}
+              />
+            </label>
+          ))}
+        </div>
+        <p className="configuration-hint">Temperatura: −20 a 60 °C, no máximo uma casa decimal, intervalo maior que 2 °C. Umidade: 0 a 100%, no máximo uma casa decimal, intervalo maior que 6 pontos. Luminosidade: inteiro entre 200 e 4095 ADC.</p>
+        {validationError && <p className="form-error" role="alert">{validationError}</p>}
+        <div className="configuration-actions">
+          <button className="primary-button" type="submit" disabled={busy || loading || tracking || blocked}>
+            {busy ? 'Enviando…' : configuration ? 'Enviar nova revisão' : 'Enviar configuração'}
+          </button>
+          {(needsVerification || timedOut || displayState === 'UNCONFIRMED') && (
+            <button className="secondary-button" type="button" onClick={onVerify} disabled={loading || busy || tracking}>
+              Verificar novamente
+            </button>
+          )}
+          {tracking && <span className="configuration-wait" role="status">Acompanhando confirmação (somente GET)…</span>}
+        </div>
+      </form>
+    </section>
+  )
+}
+
 function App() {
   const [authStatus, setAuthStatus] = useState('checking')
   const [user, setUser] = useState(null)
@@ -207,6 +354,7 @@ function App() {
   const [deviceForm, setDeviceForm] = useState({
     name: '',
     fiwareId: '',
+    mqttDeviceId: '',
     fiwareType: '',
     fiwareService: '',
     fiwareServicePath: '',
@@ -223,20 +371,41 @@ function App() {
   const [limitBusy, setLimitBusy] = useState(false)
   const [limitSaveError, setLimitSaveError] = useState('')
   const [limitSaveSuccess, setLimitSaveSuccess] = useState('')
+  const [deviceActionBusy, setDeviceActionBusy] = useState('')
+  const [deviceActionMessages, setDeviceActionMessages] = useState({})
+  const [deviceAlertCommands, setDeviceAlertCommands] = useState({})
+  const [deviceConfiguration, setDeviceConfiguration] = useState(null)
+  const [configurationLoading, setConfigurationLoading] = useState(true)
+  const [configurationError, setConfigurationError] = useState('')
+  const [configurationSubmissionError, setConfigurationSubmissionError] = useState('')
+  const [configurationBusy, setConfigurationBusy] = useState(false)
+  const [configurationTracking, setConfigurationTracking] = useState(false)
+  const [configurationTimedOut, setConfigurationTimedOut] = useState(false)
+  const [configurationNeedsVerification, setConfigurationNeedsVerification] = useState(false)
   const [now, setNow] = useState(() => new Date())
   const [selectedVineyard, setSelectedVineyard] = useState(null)
   const vineyardTriggerRef = useRef(null)
   const sessionExpiredRef = useRef(false)
   const lastSessionCheckRef = useRef(0)
+  const configurationControllerRef = useRef(null)
+  const selectedConfigurationDeviceRef = useRef(null)
+
+  const cancelConfigurationTracking = useCallback(() => {
+    configurationControllerRef.current?.abort()
+    configurationControllerRef.current = null
+    setConfigurationTracking(false)
+    setConfigurationBusy(false)
+  }, [])
 
   const handleSessionExpiration = useCallback(() => {
     if (sessionExpiredRef.current) return
     sessionExpiredRef.current = true
+    cancelConfigurationTracking()
     setUser(null)
     setCsrf(null)
     setAuthStatus('anonymous')
     setAuthError('Sua sessão expirou. Entre novamente.')
-  }, [])
+  }, [cancelConfigurationTracking])
 
   const checkSession = useCallback(async (options = {}) => {
     try {
@@ -351,6 +520,7 @@ function App() {
       setSessionWarning('')
       setEnvironmentsLoading(true)
       setDevicesLoading(true)
+      setConfigurationLoading(true)
       setUser(session)
       setCsrf(refreshedToken)
       setAuthStatus('authenticated')
@@ -371,6 +541,7 @@ function App() {
   }
 
   const handleLogout = async () => {
+    cancelConfigurationTracking()
     setLogoutBusy(true)
     setLogoutError('')
     setLogoutRetryAllowed(true)
@@ -543,13 +714,71 @@ function App() {
     }
   }, [authStatus, activeLimitDevice, limitsRetry])
 
+  useEffect(() => {
+    if (authStatus !== 'authenticated' || activeLimitDevice === null) return undefined
+    const controller = new AbortController()
+    configurationControllerRef.current = controller
+    selectedConfigurationDeviceRef.current = activeLimitDevice
+    let active = true
+    const isCurrent = () => active &&
+      !controller.signal.aborted &&
+      configurationControllerRef.current === controller &&
+      selectedConfigurationDeviceRef.current === activeLimitDevice
+    const applyConfiguration = (configuration) => {
+      if (!isCurrent()) return
+      setDeviceConfiguration(configuration)
+      setConfigurationError('')
+      setConfigurationTimedOut(false)
+      setConfigurationNeedsVerification(configuration.state === 'UNCONFIRMED')
+    }
+
+    getDeviceConfiguration(activeLimitDevice, { signal: controller.signal }).then(async (configuration) => {
+      applyConfiguration(configuration)
+      if (configuration.state === 'PENDING' || configuration.state === 'UNCONFIRMED') {
+        setConfigurationTracking(true)
+        const latest = await watchDeviceConfiguration(activeLimitDevice, {
+          signal: controller.signal,
+          expectedRevision: configuration.revision,
+          onUpdate: applyConfiguration,
+        })
+        if (!isCurrent()) return
+        if (latest) applyConfiguration(latest)
+        if (latest?.state === 'PENDING' || latest?.state === 'UNCONFIRMED') {
+          setConfigurationTimedOut(true)
+          setConfigurationNeedsVerification(true)
+        }
+      }
+    }).catch((error) => {
+      if (!isCurrent() || error.name === 'AbortError') return
+      if (error instanceof ApiError && error.status === 404) {
+        setDeviceConfiguration(null)
+        setConfigurationError('')
+        setConfigurationNeedsVerification(false)
+      } else {
+        setConfigurationError(error.message)
+        setConfigurationNeedsVerification(true)
+      }
+    }).finally(() => {
+      if (!isCurrent()) return
+      setConfigurationLoading(false)
+      setConfigurationTracking(false)
+      configurationControllerRef.current = null
+    })
+
+    return () => {
+      active = false
+      controller.abort()
+      if (configurationControllerRef.current === controller) configurationControllerRef.current = null
+    }
+  }, [authStatus, activeLimitDevice])
+
   const handleCreateEnvironment = async (event) => {
     event.preventDefault()
     setEnvironmentBusy(true)
     setEnvironmentSaveError('')
     setEnvironmentSaveSuccess('')
     try {
-      const created = await createEnvironment(environmentForm)
+      const created = await createEnvironment(environmentForm, csrf)
       setEnvironments((current) => [...current, created])
       setEnvironmentForm({ name: '', description: '' })
       setEnvironmentSaveSuccess(`Ambiente “${created.name}” cadastrado.`)
@@ -569,14 +798,23 @@ function App() {
       const created = await createDevice({
         ...deviceForm,
         environmentId: Number(deviceForm.environmentId || environments[0]?.id),
-      })
+      }, csrf)
       setDevices((current) => [...current, created])
+      cancelConfigurationTracking()
+      selectedConfigurationDeviceRef.current = created.id
+      setDeviceConfiguration(null)
+      setConfigurationLoading(true)
+      setConfigurationError('')
+      setConfigurationSubmissionError('')
+      setConfigurationNeedsVerification(false)
+      setConfigurationTimedOut(false)
       setLimitsLoading(true)
       setSelectedLimitDevice(created.id)
       setDeviceForm((current) => ({
         ...current,
         name: '',
         fiwareId: '',
+        mqttDeviceId: '',
         fiwareType: '',
         fiwareService: '',
         fiwareServicePath: '',
@@ -594,13 +832,162 @@ function App() {
     setLimitSaveError('')
     setLimitSaveSuccess('')
     try {
-      const saved = await saveDeviceLimit(deviceId, limit)
+      const saved = await saveDeviceLimit(deviceId, limit, csrf)
       setDeviceLimits((current) => [...current.filter((item) => item.metric !== saved.metric), saved])
       setLimitSaveSuccess(`Limite de ${deviceMetrics[saved.metric].label.toLowerCase()} salvo no backend.`)
     } catch (error) {
       setLimitSaveError(error.message)
     } finally {
       setLimitBusy(false)
+    }
+  }
+
+  const handleDeviceOperation = async (deviceId, operation) => {
+    const key = `${operation}:${deviceId}`
+    setDeviceActionBusy(key)
+    setDeviceActionMessages((current) => ({ ...current, [deviceId]: null }))
+    try {
+      if (operation === 'provision') {
+        await provisionDevice(deviceId, csrf)
+        setDeviceActionMessages((current) => ({
+          ...current,
+          [deviceId]: { message: 'Dispositivo provisionado no IoT Agent. Isso não cria usuário, senha nem ACL MQTT.', isError: false },
+        }))
+      } else if (operation === 'delete') {
+        const device = devices.find((item) => item.id === deviceId)
+        if (!window.confirm(`Remover o cadastro de “${device?.name || deviceId}”? Esta ação não pode ser desfeita.`)) return
+        await deleteDevice(deviceId, csrf)
+        const remaining = devices.filter((item) => item.id !== deviceId)
+        setDevices(remaining)
+        setDeviceActionMessages({})
+        setDeviceLimits([])
+        setSelectedLimitDevice(remaining[0]?.id ?? null)
+        if (selectedConfigurationDeviceRef.current === deviceId) {
+          cancelConfigurationTracking()
+          setDeviceConfiguration(null)
+          setConfigurationLoading(remaining.length > 0)
+          setConfigurationTimedOut(false)
+          setConfigurationNeedsVerification(false)
+        }
+      } else {
+        const command = deviceAlertCommands[deviceId] || 'normal'
+        await sendDeviceAlert(deviceId, command, csrf)
+        setDeviceActionMessages((current) => ({
+          ...current,
+          [deviceId]: { message: `Comando “${command}” aceito para envio. A resposta não confirma execução física pelo ESP.`, isError: false },
+        }))
+      }
+    } catch (error) {
+      setDeviceActionMessages((current) => ({ ...current, [deviceId]: { message: error.message, isError: true } }))
+    } finally {
+      setDeviceActionBusy('')
+    }
+  }
+
+  const handleConfigurationSubmit = async (values) => {
+    if (activeLimitDevice === null || configurationBusy || configurationNeedsVerification ||
+        ['PENDING', 'UNCONFIRMED'].includes(deviceConfiguration?.state)) return
+    cancelConfigurationTracking()
+    const controller = new AbortController()
+    configurationControllerRef.current = controller
+    selectedConfigurationDeviceRef.current = activeLimitDevice
+    const deviceId = activeLimitDevice
+    const isCurrent = () => !controller.signal.aborted &&
+      configurationControllerRef.current === controller &&
+      selectedConfigurationDeviceRef.current === deviceId
+    setConfigurationBusy(true)
+    setConfigurationLoading(false)
+    setConfigurationTracking(true)
+    setConfigurationSubmissionError('')
+    setConfigurationError('')
+    setConfigurationTimedOut(false)
+    setConfigurationNeedsVerification(false)
+    try {
+      const latest = await submitAndWatchDeviceConfiguration(deviceId, values, csrf, {
+        signal: controller.signal,
+        previousRevision: deviceConfiguration?.revision,
+        onUncertain: () => {
+          if (isCurrent()) setConfigurationNeedsVerification(true)
+        },
+        onUpdate: (configuration) => {
+          if (isCurrent()) {
+            setDeviceConfiguration(configuration)
+            setConfigurationNeedsVerification(configuration.state === 'UNCONFIRMED')
+          }
+        },
+      })
+      if (!isCurrent()) return
+      if (latest) setDeviceConfiguration(latest)
+      const unresolved = latest?.state === 'PENDING' || latest?.state === 'UNCONFIRMED'
+      setConfigurationTimedOut(unresolved)
+      setConfigurationNeedsVerification(unresolved || latest?.state === 'UNCONFIRMED')
+    } catch (error) {
+      if (!isCurrent() || error.name === 'AbortError') return
+      setConfigurationSubmissionError(error.message)
+      if (error.name === 'ConfigurationOutcomeUnknownError' ||
+          error.name === 'TimeoutError' ||
+          (error instanceof ApiError && [409, 502, 503].includes(error.status)) ||
+          error.message.startsWith('Não foi possível conectar ao backend.')) {
+        setConfigurationNeedsVerification(true)
+      }
+    } finally {
+      if (isCurrent()) {
+        setConfigurationBusy(false)
+        setConfigurationTracking(false)
+        configurationControllerRef.current = null
+      }
+    }
+  }
+
+  const handleVerifyConfiguration = async () => {
+    if (activeLimitDevice === null) return
+    cancelConfigurationTracking()
+    const controller = new AbortController()
+    configurationControllerRef.current = controller
+    selectedConfigurationDeviceRef.current = activeLimitDevice
+    const deviceId = activeLimitDevice
+    const isCurrent = () => !controller.signal.aborted &&
+      configurationControllerRef.current === controller &&
+      selectedConfigurationDeviceRef.current === deviceId
+    setConfigurationLoading(true)
+    setConfigurationError('')
+    setConfigurationSubmissionError('')
+    setConfigurationTimedOut(false)
+    setConfigurationTracking(false)
+    try {
+      const current = await getDeviceConfiguration(deviceId, { signal: controller.signal })
+      if (!isCurrent()) return
+      setDeviceConfiguration(current)
+      setConfigurationNeedsVerification(current.state === 'UNCONFIRMED')
+      if (current.state === 'PENDING' || current.state === 'UNCONFIRMED') {
+        setConfigurationTracking(true)
+        const latest = await watchDeviceConfiguration(deviceId, {
+          signal: controller.signal,
+          expectedRevision: current.revision,
+          onUpdate: (configuration) => {
+            if (isCurrent()) {
+              setDeviceConfiguration(configuration)
+              setConfigurationNeedsVerification(configuration.state === 'UNCONFIRMED')
+            }
+          },
+        })
+        if (!isCurrent()) return
+        if (latest) setDeviceConfiguration(latest)
+        const unresolved = latest?.state === 'PENDING' || latest?.state === 'UNCONFIRMED'
+        setConfigurationTimedOut(unresolved)
+        setConfigurationNeedsVerification(unresolved)
+      }
+    } catch (error) {
+      if (isCurrent() && error.name !== 'AbortError') {
+        setConfigurationError(error.message)
+        setConfigurationNeedsVerification(true)
+      }
+    } finally {
+      if (isCurrent()) {
+        setConfigurationLoading(false)
+        setConfigurationTracking(false)
+        configurationControllerRef.current = null
+      }
     }
   }
 
@@ -657,6 +1044,7 @@ function App() {
           <a className="nav-link" href="#ambientes"><Icon name="grapes" /> Ambientes</a>
           <a className="nav-link" href="#dispositivos"><Icon name="devices" /> Dispositivos</a>
           <a className="nav-link" href="#limites"><Icon name="settings" /> Limites</a>
+          <a className="nav-link" href="#configuracao-esp"><Icon name="settings" /> Configuração ESP</a>
           <a className="nav-link" href="#historico"><Icon name="chart" /> Histórico</a>
         </nav>
         <div className="sidebar-bottom">
@@ -673,6 +1061,7 @@ function App() {
           <a href="#ambientes">Ambientes</a>
           <a href="#dispositivos">Dispositivos</a>
           <a href="#limites">Limites</a>
+          <a href="#configuracao-esp">ESP</a>
           <a href="#historico">Histórico</a>
         </nav>
         <div className="page-content">
@@ -707,13 +1096,13 @@ function App() {
             <article className="panel alert-panel">
               <div className="panel-heading"><div><h2>Cadastro e configuração</h2><p>Gerencie ambientes, dispositivos e limites</p></div><span className="coming-soon">API Java</span></div>
               <div className="pending-feature"><span className="pending-icon"><Icon name="settings" size={19} /></span><strong>Configurações persistidas</strong><p>Os limites ficam salvos no backend. Sua avaliação e o acionamento do ESP não são automáticos nesta tela.</p></div>
-              <a className="management-link" href="#limites">Configurar limites ambientais <Icon name="arrow" size={14} /></a>
+              <a className="management-link" href="#configuracao-esp">Configurar ESP <Icon name="arrow" size={14} /></a>
             </article>
           </section>
 
           <section className="panel management-panel" id="ambientes">
             <div className="panel-heading"><div><h2>Ambientes <span className="heading-count">{environments.length}</span></h2><p>Cadastros retornados pelo backend Java</p></div><button className="secondary-button" type="button" onClick={retryEnvironments} disabled={environmentsLoading}>Atualizar</button></div>
-            <p className="management-notice">O contrato Java atual não declara autenticação ou perfis. A sessão de login do painel não protege estas rotas; aplique autorização no Java ou em um gateway antes da exposição pública.</p>
+            <p className="management-notice">Ambientes e dispositivos usam a API Java autenticada com a mesma sessão do painel. O cadastro de ambiente é independente do provisionamento de dispositivos.</p>
             <div className="management-columns">
               <form className="management-form" onSubmit={handleCreateEnvironment}>
                 <h3>Novo ambiente</h3>
@@ -741,12 +1130,13 @@ function App() {
 
           <section className="panel management-panel" id="dispositivos">
             <div className="panel-heading devices-heading"><div><h2>Dispositivos <span className="heading-count">{devices.length}</span></h2><p>Registros de sensores associados a ambientes</p></div><button className="secondary-button" type="button" onClick={retryDevices} disabled={devicesLoading}>Atualizar</button></div>
-            <p className="management-notice">Este cadastro grava metadados no backend; não provisiona uma entidade no FIWARE. Remoção ainda não está disponível na API.</p>
+            <p className="management-notice">Salvar o cadastro grava metadados no banco e não provisiona automaticamente o dispositivo no IoT Agent. O provisionamento é uma ação separada; o resultado HTTP 201 confirma o cadastro no IoT Agent, não cria credenciais nem ACL MQTT.</p>
             <div className="management-columns">
               <form className="management-form" onSubmit={handleCreateDevice}>
                 <h3>Novo dispositivo</h3>
                 <label>Nome<input value={deviceForm.name} maxLength={100} onChange={(event) => setDeviceForm((current) => ({ ...current, name: event.target.value }))} required /></label>
-                <label>ID FIWARE<input value={deviceForm.fiwareId} maxLength={255} onChange={(event) => setDeviceForm((current) => ({ ...current, fiwareId: event.target.value }))} required placeholder="Identificador da entidade existente" /></label>
+                <label>ID FIWARE<input value={deviceForm.fiwareId} maxLength={255} onChange={(event) => setDeviceForm((current) => ({ ...current, fiwareId: event.target.value }))} required placeholder="Ex.: WineSensor002" /></label>
+                <label>ID do dispositivo MQTT<input value={deviceForm.mqttDeviceId} maxLength={100} pattern="[A-Za-z0-9_-]{1,100}" onChange={(event) => setDeviceForm((current) => ({ ...current, mqttDeviceId: event.target.value }))} required placeholder="Ex.: wine002" /><span>1–100 caracteres: letras, números, hífen ou sublinhado. Diferente do ID FIWARE.</span></label>
                 <label>Tipo FIWARE<input value={deviceForm.fiwareType} maxLength={100} onChange={(event) => setDeviceForm((current) => ({ ...current, fiwareType: event.target.value }))} required /></label>
                 <div className="management-fields">
                   <label>FIWARE service<input value={deviceForm.fiwareService} maxLength={100} onChange={(event) => setDeviceForm((current) => ({ ...current, fiwareService: event.target.value }))} required /></label>
@@ -768,8 +1158,25 @@ function App() {
                 {!devicesLoading && !devicesError && devices.map((device) => (
                   <article className="management-item device-management-item" key={device.id}>
                     <span className="management-item-icon"><Icon name="devices" size={17} /></span>
-                    <div><strong>{device.name}</strong><p>{device.fiwareId} · {device.environmentName} · {device.active ? 'Ativo' : 'Inativo'}</p><small>{device.fiwareType} · {device.fiwareService}{device.fiwareServicePath}</small></div>
-                    <span className="management-id">#{device.id}</span>
+                    <div className="device-management-details">
+                      <strong>{device.name}</strong>
+                      <p>Banco #{device.id} · FIWARE {device.fiwareId} · MQTT {device.mqttDeviceId}</p>
+                      <small>{device.fiwareType} · {device.fiwareService}{device.fiwareServicePath} · {device.environmentName} · {device.active ? 'Ativo' : 'Inativo'}</small>
+                      <div className="device-actions">
+                        <button className="secondary-button" type="button" onClick={() => handleDeviceOperation(device.id, 'provision')} disabled={deviceActionBusy !== ''}>{deviceActionBusy === `provision:${device.id}` ? 'Provisionando…' : 'Provisionar no IoT Agent'}</button>
+                        <label>Comando de alerta
+                          <select value={deviceAlertCommands[device.id] || 'normal'} onChange={(event) => setDeviceAlertCommands((current) => ({ ...current, [device.id]: event.target.value }))} disabled={deviceActionBusy !== ''}>
+                            <option value="normal">Normal</option>
+                            <option value="temperature">Temperatura</option>
+                            <option value="humidity">Umidade</option>
+                            <option value="luminosity">Luminosidade</option>
+                          </select>
+                        </label>
+                        <button className="secondary-button" type="button" onClick={() => handleDeviceOperation(device.id, 'alert')} disabled={deviceActionBusy !== ''}>{deviceActionBusy === `alert:${device.id}` ? 'Enviando…' : 'Enviar comando'}</button>
+                        <button className="danger-button" type="button" onClick={() => handleDeviceOperation(device.id, 'delete')} disabled={deviceActionBusy !== ''}>{deviceActionBusy === `delete:${device.id}` ? 'Removendo…' : 'Remover cadastro'}</button>
+                      </div>
+                      {deviceActionMessages[device.id]?.message && <p className={deviceActionMessages[device.id].isError ? 'form-error' : 'form-success'} role={deviceActionMessages[device.id].isError ? 'alert' : 'status'}>{deviceActionMessages[device.id].message}</p>}
+                    </div>
                   </article>
                 ))}
               </div>
@@ -778,13 +1185,22 @@ function App() {
 
           <section className="panel management-panel" id="limites">
             <div className="panel-heading"><div><h2>Limites ambientais</h2><p>Configuração por dispositivo e métrica</p></div></div>
-            <p className="management-notice">Salvar limites apenas persiste a configuração no backend; não aciona o ESP nem avalia alertas automaticamente. Confirme com a equipe técnica as faixas e unidades adequadas aos sensores.</p>
+            <p className="management-notice">Este cadastro apenas persiste limites independentes por métrica no banco. Ele não configura o ESP, não aciona comandos e não avalia alertas automaticamente. Para enviar os cinco parâmetros ao dispositivo, use a configuração completa do ESP abaixo.</p>
             {devices.length > 0 && <label className="device-limit-select">Dispositivo<select value={activeLimitDevice ?? ''} onChange={(event) => {
+              const nextDeviceId = Number(event.target.value)
+              cancelConfigurationTracking()
+              selectedConfigurationDeviceRef.current = nextDeviceId
               setLimitsLoading(true)
               setLimitsError('')
-              setSelectedLimitDevice(Number(event.target.value))
+              setConfigurationLoading(true)
+              setConfigurationError('')
+              setConfigurationSubmissionError('')
+              setConfigurationTimedOut(false)
+              setConfigurationNeedsVerification(false)
+              setDeviceConfiguration(null)
+              setSelectedLimitDevice(nextDeviceId)
             }}>
-              {devices.map((device) => <option key={device.id} value={device.id}>{device.name} · {device.fiwareId}</option>)}
+              {devices.map((device) => <option key={device.id} value={device.id}>{device.name} · {device.fiwareId} · {device.mqttDeviceId}</option>)}
             </select></label>}
             {limitSaveError && <p className="form-error" role="alert">{limitSaveError}</p>}
             {limitSaveSuccess && <p className="form-success" role="status">{limitSaveSuccess}</p>}
@@ -804,6 +1220,22 @@ function App() {
               ))}
             </div>}
           </section>
+
+          {activeLimitDevice !== null && <div id="configuracao-esp">
+            <DeviceConfigurationPanel
+              deviceId={activeLimitDevice}
+              configuration={deviceConfiguration}
+              loading={configurationLoading}
+              error={configurationError}
+              submissionError={configurationSubmissionError}
+              busy={configurationBusy}
+              tracking={configurationTracking}
+              timedOut={configurationTimedOut}
+              needsVerification={configurationNeedsVerification}
+              onSubmit={handleConfigurationSubmit}
+              onVerify={handleVerifyConfiguration}
+            />
+          </div>}
 
           <section className="panel devices-panel" id="dispositivo-monitorado">
             <div className="panel-heading devices-heading"><div><h2>Leituras do WineSensor002</h2><p>Telemetria consultada no serviço Express</p></div></div>

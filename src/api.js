@@ -13,10 +13,11 @@ export const API_REFRESH_INTERVAL_MS = readPositiveSetting(import.meta.env?.VITE
 const sessionExpirationListeners = new Set()
 
 export class ApiError extends Error {
-  constructor(message, status) {
+  constructor(message, status, payload = null) {
     super(message)
     this.name = 'ApiError'
     this.status = status
+    this.payload = payload
   }
 }
 
@@ -55,6 +56,7 @@ function validateDevice(data) {
       !Number.isInteger(data.id) || data.id < 1 ||
       typeof data.name !== 'string' || data.name.trim() === '' ||
       typeof data.fiwareId !== 'string' || data.fiwareId.trim() === '' ||
+      typeof data.mqttDeviceId !== 'string' || !/^[A-Za-z0-9_-]{1,100}$/.test(data.mqttDeviceId) ||
       typeof data.fiwareType !== 'string' || data.fiwareType.trim() === '' ||
       typeof data.fiwareService !== 'string' || data.fiwareService.trim() === '' ||
       typeof data.fiwareServicePath !== 'string' || data.fiwareServicePath.trim() === '' ||
@@ -66,6 +68,7 @@ function validateDevice(data) {
     id: data.id,
     name: data.name,
     fiwareId: data.fiwareId,
+    mqttDeviceId: data.mqttDeviceId,
     fiwareType: data.fiwareType,
     fiwareService: data.fiwareService,
     fiwareServicePath: data.fiwareServicePath,
@@ -96,7 +99,51 @@ function validateLimit(data) {
   }
 }
 
-async function getJson(path, { signal, timeoutMs = API_TIMEOUT_MS, protectedRequest = false, ...requestOptions } = {}) {
+function formatFieldErrors(errors) {
+  if (!errors) return []
+  if (Array.isArray(errors)) {
+    return errors.map((error) => {
+      if (typeof error === 'string') return error
+      if (!error || typeof error !== 'object') return ''
+      const field = error.field || error.property
+      const message = error.message || error.defaultMessage || error.detail
+      return field && message ? `${field}: ${message}` : String(message || '')
+    }).filter(Boolean)
+  }
+  if (typeof errors === 'object') {
+    return Object.entries(errors).flatMap(([field, messages]) =>
+      (Array.isArray(messages) ? messages : [messages])
+        .filter((message) => typeof message === 'string')
+        .map((message) => `${field}: ${message}`))
+  }
+  return []
+}
+
+async function responseError(response) {
+  const text = await response.text()
+  let payload = null
+  if (text) {
+    try {
+      payload = JSON.parse(text)
+    } catch {
+      payload = text
+    }
+  }
+  const details = typeof payload === 'string'
+    ? payload
+    : payload && typeof payload === 'object'
+      ? [payload.detail, payload.message, payload.title, payload.error].find((item) => typeof item === 'string' && item.trim() !== '')
+      : ''
+  const fieldErrors = formatFieldErrors(payload?.fieldErrors || payload?.errors || payload?.violations)
+  const message = [
+    `HTTP ${response.status}`,
+    details,
+    ...fieldErrors,
+  ].filter(Boolean).join(': ')
+  return new ApiError(message || `O backend respondeu com erro HTTP ${response.status}.`, response.status, payload)
+}
+
+async function request(path, { signal, timeoutMs = API_TIMEOUT_MS, protectedRequest = false, ...requestOptions } = {}) {
   const controller = new AbortController()
   let timedOut = false
   const abortFromCaller = () => controller.abort(signal.reason)
@@ -117,20 +164,9 @@ async function getJson(path, { signal, timeoutMs = API_TIMEOUT_MS, protectedRequ
 
     if (!response.ok) {
       if (protectedRequest && response.status === 401) notifySessionExpired()
-      throw new ApiError(`O backend respondeu com erro HTTP ${response.status}. Tente novamente.`, response.status)
+      throw await responseError(response)
     }
-
-    if (!response.headers.get('content-type')?.includes('application/json')) {
-      throw new Error('A resposta não está em JSON. Verifique se o proxy /api está configurado para o backend.')
-    }
-
-    try {
-      return await response.json()
-    } catch (error) {
-      if (timedOut) throw error
-      if (signal?.aborted || error.name === 'AbortError') throw error
-      throw new Error('O backend retornou uma resposta JSON inválida.', { cause: error })
-    }
+    return response
   } catch (error) {
     if (timedOut) {
       const timeoutError = new Error(`A consulta ao backend excedeu o limite de ${timeoutMs / 1000} segundos. Tente novamente.`, { cause: error })
@@ -138,11 +174,29 @@ async function getJson(path, { signal, timeoutMs = API_TIMEOUT_MS, protectedRequ
       throw timeoutError
     }
     if (signal?.aborted || error.name === 'AbortError') throw error
-    if (error instanceof ApiError || error.message.startsWith('A resposta não está em JSON') || error.message.startsWith('O backend retornou uma resposta JSON inválida')) throw error
+    if (error instanceof ApiError) throw error
     throw new Error('Não foi possível conectar ao backend. Verifique a configuração do proxy e tente novamente.', { cause: error })
   } finally {
     clearTimeout(timeout)
     signal?.removeEventListener('abort', abortFromCaller)
+  }
+}
+
+async function getJson(path, options, expectedStatus) {
+  const response = await request(path, options)
+  if (expectedStatus && response.status !== expectedStatus) {
+    const statusError = new ApiError(`Resposta inesperada do backend (HTTP ${response.status}; esperado HTTP ${expectedStatus}).`, response.status)
+    statusError.outcomeUnknown = response.ok
+    throw statusError
+  }
+  if (!response.headers.get('content-type')?.includes('application/json')) {
+    throw new Error('A resposta não está em JSON. Verifique se o proxy /api está configurado para o backend.')
+  }
+  try {
+    return await response.json()
+  } catch (error) {
+    if (options?.signal?.aborted || error.name === 'AbortError') throw error
+    throw new Error('O backend retornou uma resposta JSON inválida.', { cause: error })
   }
 }
 
@@ -153,6 +207,67 @@ function validateCsrfToken(data) {
     throw new Error('A resposta do token CSRF não corresponde ao formato esperado.')
   }
   return { headerName: data.headerName, token: data.token }
+}
+
+function requireCsrf(csrf) {
+  if (!csrf?.headerName || !csrf?.token) {
+    throw new Error('Não foi possível validar a solicitação protegida. Atualize o token CSRF e tente novamente.')
+  }
+  return { [csrf.headerName]: csrf.token }
+}
+
+function withCsrfHeaders(csrf, headers = {}) {
+  return { ...headers, ...requireCsrf(csrf) }
+}
+
+const DEVICE_CONFIGURATION_STATES = ['PENDING', 'APPLIED', 'REJECTED', 'UNCONFIRMED']
+
+function hasOneDecimalPlace(value) {
+  return Number.isFinite(value) && Number(value.toFixed(1)) === value
+}
+
+export function validateDeviceConfigurationValues(configuration) {
+  const { temperatureMin, temperatureMax, humidityMin, humidityMax, luminosityMax } = configuration || {}
+  if (!hasOneDecimalPlace(temperatureMin) || temperatureMin < -20 || temperatureMin > 60 ||
+      !hasOneDecimalPlace(temperatureMax) || temperatureMax < -20 || temperatureMax > 60 ||
+      temperatureMax - temperatureMin <= 2 ||
+      !hasOneDecimalPlace(humidityMin) || humidityMin < 0 || humidityMin > 100 ||
+      !hasOneDecimalPlace(humidityMax) || humidityMax < 0 || humidityMax > 100 ||
+      humidityMax - humidityMin <= 6 ||
+      !Number.isInteger(luminosityMax) || luminosityMax < 200 || luminosityMax > 4095) {
+    throw new Error('Revise os limites: temperatura de −20 a 60 °C (intervalo maior que 2 °C), umidade de 0 a 100% (intervalo maior que 6 pontos) e luminosidade inteira de 200 a 4095 ADC. Temperatura e umidade aceitam no máximo uma casa decimal.')
+  }
+  return { temperatureMin, temperatureMax, humidityMin, humidityMax, luminosityMax }
+}
+
+function validateDeviceConfiguration(data) {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    throw new Error('A resposta da configuração do dispositivo não corresponde ao formato esperado.')
+  }
+  const revision = data.revision
+  const state = String(data.state || data.status || '').toUpperCase()
+  if (!((typeof revision === 'string' && revision.trim() !== '') || (Number.isInteger(revision) && revision > 0)) ||
+      !DEVICE_CONFIGURATION_STATES.includes(state) ||
+      !isValidTimestamp(data.createdAt) ||
+      !(data.confirmedAt === null || (typeof data.confirmedAt === 'string' && isValidTimestamp(data.confirmedAt))) ||
+      !(data.rejectionReason === null || data.rejectionReason === undefined || typeof data.rejectionReason === 'string')) {
+    throw new Error('A resposta da configuração do dispositivo não corresponde ao formato esperado.')
+  }
+  const values = validateDeviceConfigurationValues(data)
+  return {
+    revision,
+    ...values,
+    state,
+    createdAt: data.createdAt,
+    confirmedAt: data.confirmedAt ?? null,
+    rejectionReason: data.rejectionReason ?? null,
+  }
+}
+
+function validateDeviceId(deviceId) {
+  if (!Number.isInteger(deviceId) || deviceId < 1) {
+    throw new Error('O identificador do dispositivo deve ser um inteiro positivo.')
+  }
 }
 
 export async function getCsrfToken(options) {
@@ -253,7 +368,7 @@ export async function getEnvironments(options) {
   return data.map(validateEnvironment)
 }
 
-export async function createEnvironment(environment, options) {
+export async function createEnvironment(environment, csrf, options) {
   if (!environment || typeof environment.name !== 'string' || environment.name.trim() === '' ||
       !(environment.description === undefined || environment.description === null || typeof environment.description === 'string')) {
     throw new Error('Informe um nome válido para o ambiente.')
@@ -261,7 +376,7 @@ export async function createEnvironment(environment, options) {
   return validateEnvironment(await getJson('/api/environments', {
     ...options,
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: withCsrfHeaders(csrf, { 'Content-Type': 'application/json' }),
     body: JSON.stringify({ name: environment.name.trim(), description: environment.description?.trim() || null }),
     protectedRequest: true,
   }))
@@ -273,32 +388,31 @@ export async function getDevices(options) {
   return data.map(validateDevice)
 }
 
-export async function createDevice(device, options) {
-  if (!device || ['name', 'fiwareId', 'fiwareType', 'fiwareService', 'fiwareServicePath'].some((key) =>
+export async function createDevice(device, csrf, options) {
+  if (!device || ['name', 'fiwareId', 'fiwareType', 'fiwareService', 'fiwareServicePath', 'mqttDeviceId'].some((key) =>
     typeof device[key] !== 'string' || device[key].trim() === '') ||
       !Number.isInteger(device.environmentId) || device.environmentId < 1) {
     throw new Error('Preencha os dados do dispositivo e selecione um ambiente válido.')
   }
+  const mqttDeviceId = device.mqttDeviceId.trim()
+  if (mqttDeviceId.length < 1 || mqttDeviceId.length > 100 || !/^[A-Za-z0-9_-]+$/.test(mqttDeviceId)) {
+    throw new Error('O ID MQTT deve ter de 1 a 100 caracteres: letras, números, hífen ou sublinhado.')
+  }
   return validateDevice(await getJson('/api/devices', {
     ...options,
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: withCsrfHeaders(csrf, { 'Content-Type': 'application/json' }),
     body: JSON.stringify({
       name: device.name.trim(),
       fiwareId: device.fiwareId.trim(),
       fiwareType: device.fiwareType.trim(),
       fiwareService: device.fiwareService.trim(),
       fiwareServicePath: device.fiwareServicePath.trim(),
+      mqttDeviceId,
       environmentId: device.environmentId,
     }),
     protectedRequest: true,
   }))
-}
-
-function validateDeviceId(deviceId) {
-  if (!Number.isInteger(deviceId) || deviceId < 1) {
-    throw new Error('O identificador do dispositivo deve ser um inteiro positivo.')
-  }
 }
 
 export async function getDeviceLimits(deviceId, options) {
@@ -308,7 +422,7 @@ export async function getDeviceLimits(deviceId, options) {
   return data.map(validateLimit)
 }
 
-export async function saveDeviceLimit(deviceId, limit, options) {
+export async function saveDeviceLimit(deviceId, limit, csrf, options) {
   validateDeviceId(deviceId)
   if (!limit || !DEVICE_METRICS.includes(limit.metric) ||
       !(limit.minimumValue === null || (typeof limit.minimumValue === 'number' && Number.isFinite(limit.minimumValue))) ||
@@ -321,7 +435,7 @@ export async function saveDeviceLimit(deviceId, limit, options) {
   return validateLimit(await getJson(`/api/devices/${deviceId}/limits`, {
     ...options,
     method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
+    headers: withCsrfHeaders(csrf, { 'Content-Type': 'application/json' }),
     body: JSON.stringify({
       metric: limit.metric,
       minimumValue: limit.minimumValue,
@@ -330,4 +444,249 @@ export async function saveDeviceLimit(deviceId, limit, options) {
     }),
     protectedRequest: true,
   }))
+}
+
+export async function provisionDevice(deviceId, csrf, options) {
+  validateDeviceId(deviceId)
+  const response = await request(`/api/devices/${deviceId}/provision`, {
+    ...options,
+    method: 'POST',
+    headers: withCsrfHeaders(csrf),
+    protectedRequest: true,
+  })
+  if (response.status !== 201) {
+    throw new ApiError(`Resposta inesperada ao provisionar dispositivo (HTTP ${response.status}).`, response.status)
+  }
+}
+
+export async function deleteDevice(deviceId, csrf, options) {
+  validateDeviceId(deviceId)
+  const response = await request(`/api/devices/${deviceId}`, {
+    ...options,
+    method: 'DELETE',
+    headers: withCsrfHeaders(csrf),
+    protectedRequest: true,
+  })
+  if (response.status !== 204) {
+    throw new ApiError(`Resposta inesperada ao remover dispositivo (HTTP ${response.status}).`, response.status)
+  }
+}
+
+const ALERT_COMMANDS = ['normal', 'temperature', 'humidity', 'luminosity']
+
+export async function sendDeviceAlert(deviceId, command, csrf, options) {
+  validateDeviceId(deviceId)
+  if (!ALERT_COMMANDS.includes(command)) {
+    throw new Error('Comando de alerta inválido.')
+  }
+  const response = await request(`/api/devices/${deviceId}/commands/alert`, {
+    ...options,
+    method: 'POST',
+    headers: withCsrfHeaders(csrf, { 'Content-Type': 'application/json' }),
+    body: JSON.stringify({ command }),
+    protectedRequest: true,
+  })
+  if (response.status !== 202) {
+    throw new ApiError(`Resposta inesperada ao enviar comando de alerta (HTTP ${response.status}).`, response.status)
+  }
+}
+
+export async function getDeviceConfiguration(deviceId, options) {
+  validateDeviceId(deviceId)
+  return validateDeviceConfiguration(await getJson(`/api/devices/${deviceId}/configuration`, {
+    ...options,
+    protectedRequest: true,
+  }))
+}
+
+export async function createDeviceConfiguration(deviceId, values, csrf, options) {
+  validateDeviceId(deviceId)
+  const configuration = validateDeviceConfigurationValues(values)
+  let data
+  try {
+    data = await getJson(`/api/devices/${deviceId}/configuration`, {
+      ...options,
+      method: 'POST',
+      headers: withCsrfHeaders(csrf, { 'Content-Type': 'application/json' }),
+      body: JSON.stringify(configuration),
+      protectedRequest: true,
+    }, 202)
+  } catch (error) {
+    if (!(error instanceof ApiError) || error.outcomeUnknown) error.outcomeUnknown = true
+    throw error
+  }
+  let saved
+  try {
+    saved = validateDeviceConfiguration(data)
+  } catch (error) {
+    error.outcomeUnknown = true
+    throw error
+  }
+  if (saved.state !== 'PENDING') {
+    const stateError = new Error('A API aceitou a configuração em um estado diferente de PENDING.')
+    stateError.outcomeUnknown = true
+    throw stateError
+  }
+  return saved
+}
+
+function isUncertainConfigurationRequestError(error) {
+  return error.outcomeUnknown === true ||
+    error.name === 'TimeoutError' ||
+    (error instanceof ApiError && [409, 502, 503].includes(error.status)) ||
+    error.message.startsWith('Não foi possível conectar ao backend.')
+}
+
+function isConfigurationTerminal(configuration) {
+  return configuration.state === 'APPLIED' || configuration.state === 'REJECTED'
+}
+
+function delay(milliseconds, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new DOMException('Aborted', 'AbortError'))
+      return
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', abort)
+      resolve()
+    }, milliseconds)
+    const abort = () => {
+      clearTimeout(timer)
+      signal.removeEventListener('abort', abort)
+      reject(new DOMException('Aborted', 'AbortError'))
+    }
+    signal?.addEventListener('abort', abort, { once: true })
+  })
+}
+
+export async function watchDeviceConfiguration(deviceId, {
+  signal,
+  intervalMs = 5000,
+  timeoutMs = 45000,
+  onUpdate,
+  expectedRevision,
+  matches = () => true,
+} = {}) {
+  validateDeviceId(deviceId)
+  if (!Number.isFinite(intervalMs) || intervalMs <= 0 || !Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    throw new Error('Os intervalos de acompanhamento da configuração devem ser positivos.')
+  }
+  const startedAt = Date.now()
+  let latestMatching = null
+  while (Date.now() - startedAt < timeoutMs) {
+    const remaining = timeoutMs - (Date.now() - startedAt)
+    await delay(Math.min(intervalMs, remaining), signal)
+    const requestTimeRemaining = timeoutMs - (Date.now() - startedAt)
+    if (requestTimeRemaining <= 0) break
+    const latest = await getDeviceConfiguration(deviceId, { signal, timeoutMs: requestTimeRemaining })
+    const revisionMatches = expectedRevision === undefined ||
+      String(latest.revision) === String(expectedRevision)
+    if (!revisionMatches || !matches(latest)) continue
+    latestMatching = latest
+    onUpdate?.(latest)
+    if (isConfigurationTerminal(latest)) return latest
+  }
+  if (latestMatching) return latestMatching
+  const unknownError = new Error('A API ainda não retornou a revisão correspondente a esta solicitação.')
+  unknownError.name = 'ConfigurationOutcomeUnknownError'
+  throw unknownError
+}
+
+export async function submitAndWatchDeviceConfiguration(deviceId, values, csrf, {
+  signal,
+  intervalMs = 5000,
+  timeoutMs = 45000,
+  onUpdate,
+  onUncertain,
+  previousRevision,
+} = {}) {
+  validateDeviceId(deviceId)
+  if (!Number.isFinite(intervalMs) || intervalMs <= 0 || !Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    throw new Error('Os intervalos de acompanhamento da configuração devem ser positivos.')
+  }
+  const startedAt = Date.now()
+  const getRemainingTime = () => timeoutMs - (Date.now() - startedAt)
+  const watchRemainingTime = (options) => {
+    const remaining = getRemainingTime()
+    if (remaining <= 0) {
+      const unknownError = new Error('O prazo de 45 segundos terminou antes da confirmação desta revisão.')
+      unknownError.name = 'ConfigurationOutcomeUnknownError'
+      throw unknownError
+    }
+    return watchDeviceConfiguration(deviceId, {
+      signal,
+      intervalMs,
+      timeoutMs: remaining,
+      ...options,
+    })
+  }
+  const sameValues = (configuration) =>
+    Object.entries(values).every(([field, value]) => configuration[field] === value)
+  const isNewConfiguration = (configuration) =>
+    sameValues(configuration) &&
+    (previousRevision === undefined || String(configuration.revision) !== String(previousRevision))
+  let initial
+  try {
+    initial = await createDeviceConfiguration(deviceId, values, csrf, {
+      signal,
+      timeoutMs: Math.min(API_TIMEOUT_MS, timeoutMs),
+    })
+  } catch (error) {
+    if (!isUncertainConfigurationRequestError(error)) throw error
+    onUncertain?.()
+    try {
+      const remaining = getRemainingTime()
+      initial = await getDeviceConfiguration(deviceId, {
+        signal,
+        timeoutMs: remaining > 0 ? remaining : API_TIMEOUT_MS,
+      })
+    } catch (verificationError) {
+      if (verificationError.name === 'AbortError' || (verificationError instanceof ApiError && verificationError.status === 401)) {
+        throw verificationError
+      }
+      const unknownError = new Error(`O resultado do envio é desconhecido. A consulta de estado também falhou: ${verificationError.message}`, { cause: verificationError })
+      unknownError.name = 'ConfigurationOutcomeUnknownError'
+      throw unknownError
+    }
+    if (!isNewConfiguration(initial)) {
+      try {
+        return await watchRemainingTime({
+          matches: isNewConfiguration,
+          onUpdate,
+        })
+      } catch (watchError) {
+        if (watchError.name === 'AbortError' || (watchError instanceof ApiError && watchError.status === 401)) throw watchError
+        const unknownError = new Error(`O resultado do envio é desconhecido. Não foi possível confirmar uma nova revisão: ${watchError.message}`, { cause: watchError })
+        unknownError.name = 'ConfigurationOutcomeUnknownError'
+        throw unknownError
+      }
+    }
+    onUpdate?.(initial)
+    if (isConfigurationTerminal(initial)) return initial
+    try {
+      return await watchRemainingTime({
+        expectedRevision: initial.revision,
+        onUpdate,
+      })
+    } catch (watchError) {
+      if (watchError.name === 'AbortError' || (watchError instanceof ApiError && watchError.status === 401)) throw watchError
+      const unknownError = new Error(`O envio foi aceito ou pode ter sido aceito, mas não foi possível confirmar o estado: ${watchError.message}`, { cause: watchError })
+      unknownError.name = 'ConfigurationOutcomeUnknownError'
+      throw unknownError
+    }
+  }
+  onUpdate?.(initial)
+  if (isConfigurationTerminal(initial)) return initial
+  try {
+    return await watchRemainingTime({
+      expectedRevision: initial.revision,
+      onUpdate,
+    })
+  } catch (watchError) {
+    if (watchError.name === 'AbortError' || (watchError instanceof ApiError && watchError.status === 401)) throw watchError
+    const unknownError = new Error(`A configuração foi enviada, mas não foi possível confirmar o estado: ${watchError.message}`, { cause: watchError })
+    unknownError.name = 'ConfigurationOutcomeUnknownError'
+    throw unknownError
+  }
 }
